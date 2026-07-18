@@ -1513,7 +1513,9 @@ function tests.execute_command_routes_driver_commands()
   local launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
   assert_table_has(launch, "_i", "_launchApp")
   assert_table_has(launch._c, "_bundleID", "com.netflix.Netflix")
-  assert_eq(Properties["Current App"], "com.netflix.Netflix", "current app property")
+  -- "Current App" is not set by issuing the launch; it is published only once
+  -- the launch is confirmed by an ack or a foreground event.
+  assert_eq(Properties["Current App"], "", "current app not set until confirmation")
 
   ExecuteCommand("Launch App", { ["Bundle ID or URL"] = "https://www.netflix.com/title/80234304" })
   launch = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
@@ -2298,113 +2300,229 @@ function tests.mini_app_launch_debounces_duplicate_switcher_burst()
   Driver.Companion.app_list_rows = old_app_rows
 end
 
-function tests.mini_app_launch_schedules_startup_retry()
-  local old_c4 = C4
-  local old_set_timer = SetTimer
-  local old_cancel_timer = CancelTimer
-  local old_client = Driver.Companion.client
-  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
-  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
-  local old_retry_id = Driver.C4MiniApps.pending_launch_retry_id
-  local scheduled
-  local cancelled
-
-  C4 = {
-    GetTime = function() return 2000 end,
+-- Shared harness for the confirmation-driven launch tests. Installs fake timers
+-- (captured in env.armed, fired via env.fire_last), a clean launch state, and
+-- restores every global it touched afterward.
+local function run_launch_test(fn)
+  local saved = {
+    C4 = C4,
+    SetTimer = SetTimer,
+    CancelTimer = CancelTimer,
+    client = Driver.Companion.client,
+    pending = Driver.Companion.launch.pending,
+    generation = Driver.Companion.session_generation,
+    sent = Driver.Companion.sent_messages,
+    current_app = Driver.Companion.current_app,
+    app_list = Driver.Companion.app_list,
   }
+  local env = { armed = {}, cancelled = {} }
+  C4 = { GetTime = function() return 1000 end }
   SetTimer = function(name, delay, callback)
-    scheduled = { name = name, delay = delay, callback = callback }
+    env.armed[#env.armed + 1] = { name = name, delay = delay, callback = callback }
+    return { Cancel = function() end }
   end
   CancelTimer = function(name)
-    cancelled = name
+    env.cancelled[#env.cancelled + 1] = name
   end
-  Driver.Companion.client = {
-    state = "SESSION_ACTIVE",
-    session_active_since_ms = 1000,
-  }
-  Driver.C4MiniApps.last_launch_id = nil
-  Driver.C4MiniApps.last_launch_at_ms = nil
-  Driver.C4MiniApps.pending_launch_retry_id = nil
-  Driver.C4MiniApps.register_binding(3101, {
-    name = "DirecTV",
-    service_id = "DirecTV",
-  })
+  function env.fire_last()
+    local last = env.armed[#env.armed]
+    assert(last, "no timer armed to fire")
+    last.callback()
+  end
+  function env.launch_count()
+    local n = 0
+    for _, m in ipairs(Driver.Companion.sent_messages) do
+      if m._i == "_launchApp" then n = n + 1 end
+    end
+    return n
+  end
+  Driver.Companion.client = nil
+  Driver.Companion.launch.pending = nil
+  Driver.Companion.session_generation = 1
   Driver.Companion.sent_messages = {}
+  Driver.Companion.current_app = nil
+  Driver.Companion.app_list = {}
 
-  ReceivedFromProxy(3101, "SELECT", {})
+  local ok, err = pcall(fn, env)
 
-  assert_eq(Driver.Companion.sent_messages[1]._c._bundleID, "com.att.tv", "initial directv launch")
-  assert(scheduled ~= nil, "startup retry scheduled")
-  assert_eq(scheduled.name, Driver.C4MiniApps.launch_retry_timer, "retry timer name")
-  assert_eq(scheduled.delay, Driver.C4MiniApps.launch_retry_delay_ms, "retry timer delay")
-  assert_eq(cancelled, Driver.C4MiniApps.launch_retry_timer, "old retry timer cancelled")
-
-  scheduled.callback()
-
-  assert_eq(Driver.Companion.sent_messages[2]._c._bundleID, "com.att.tv", "retry directv launch")
-
-  C4 = old_c4
-  SetTimer = old_set_timer
-  CancelTimer = old_cancel_timer
-  Driver.Companion.client = old_client
-  Driver.C4MiniApps.last_launch_id = old_last_launch_id
-  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
-  Driver.C4MiniApps.pending_launch_retry_id = old_retry_id
+  C4 = saved.C4
+  SetTimer = saved.SetTimer
+  CancelTimer = saved.CancelTimer
+  Driver.Companion.client = saved.client
+  Driver.Companion.launch.pending = saved.pending
+  Driver.Companion.session_generation = saved.generation
+  Driver.Companion.sent_messages = saved.sent
+  Driver.Companion.current_app = saved.current_app
+  Driver.Companion.app_list = saved.app_list
+  if not ok then error(err, 0) end
 end
 
-function tests.mini_app_launch_before_session_defers_startup_retry()
-  local old_c4 = C4
-  local old_set_timer = SetTimer
-  local old_cancel_timer = CancelTimer
-  local old_client = Driver.Companion.client
-  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
-  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
-  local old_retry_id = Driver.C4MiniApps.pending_launch_retry_id
-  local scheduled
+function tests.launch_confirms_on_ack_and_never_retries()
+  run_launch_test(function(env)
+    local writes = {}
+    local client = Driver.CompanionClient.new({
+      credentials = Driver.Credentials.parse(table.concat({
+        Driver.Bytes.hex(string.rep("\x01", 32)),
+        Driver.Bytes.hex(string.rep("\x02", 32)),
+        Driver.Bytes.hex("ATV-ID"),
+        Driver.Bytes.hex("CLIENT-ID"),
+      }, ":")),
+      crypto = {
+        encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+        decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+      },
+      transport = { Write = function(_, data) writes[#writes + 1] = data end },
+    })
+    client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+    client.state = "SESSION_ACTIVE"
+    Driver.Companion.client = client
 
-  C4 = {
-    GetTime = function() return 3000 end,
-  }
-  SetTimer = function(name, delay, callback)
-    scheduled = { name = name, delay = delay, callback = callback }
-  end
-  CancelTimer = function() end
-  Driver.Companion.client = {
-    state = "DISCONNECTED",
-  }
-  Driver.C4MiniApps.last_launch_id = nil
-  Driver.C4MiniApps.last_launch_at_ms = nil
-  Driver.C4MiniApps.pending_launch_retry_id = nil
-  Driver.C4MiniApps.register_binding(3101, {
-    name = "DirecTV",
-    service_id = "DirecTV",
-  })
-  Driver.Companion.sent_messages = {}
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    assert(Driver.Companion.launch.pending ~= nil, "launch is pending until confirmed")
+    local xid = next(client.pending_responses)
+    assert(xid ~= nil, "launch registered a pending ack handler")
+    assert(#env.armed >= 1, "confirm timer armed")
+    local writes_before = #writes
 
-  ReceivedFromProxy(3101, "SELECT", {})
+    -- The Apple TV acks the launch.
+    client.pending_responses[xid].on_response({})
+    assert_eq(Driver.Companion.launch.pending, nil, "ack clears the pending launch")
 
-  assert_eq(Driver.Companion.sent_messages[1]._c._bundleID, "com.att.tv", "initial directv launch requested")
-  assert_eq(scheduled, nil, "retry waits for startup window")
-  assert_eq(Driver.C4MiniApps.pending_launch_retry_id, "com.att.tv", "retry id retained")
+    -- A stale confirm timer firing afterward must not re-launch.
+    env.fire_last()
+    assert_eq(#writes, writes_before, "no resend after a confirmed launch")
+  end)
+end
 
-  Driver.Companion.client.session_active_since_ms = 2500
+function tests.launch_confirms_on_foreground_event()
+  run_launch_test(function()
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    assert(Driver.Companion.launch.pending ~= nil, "pending before any device report")
 
-  Driver.C4MiniApps.schedule_pending_launch_retry()
+    -- The optimistic current_app set at launch time must not self-confirm.
+    Driver.C4Driver.note_current_app_observed(nil)
+    assert(Driver.Companion.launch.pending ~= nil, "optimistic value does not confirm")
 
-  assert(scheduled ~= nil, "retry scheduled once session is active")
-  assert_eq(scheduled.name, Driver.C4MiniApps.launch_retry_timer, "retry timer name")
+    -- A genuine device report naming the target confirms it.
+    Driver.C4Driver.handle_companion_message({ _i = "CurrentApp", _c = { app_id = "com.netflix.Netflix" } })
+    assert_eq(Driver.Companion.launch.pending, nil, "foreground event confirms the launch")
+  end)
+end
 
-  scheduled.callback()
+function tests.launch_superseded_by_external_app_change()
+  run_launch_test(function(env)
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    -- User jumps to a different app out-of-band (e.g. voice / Apple TV remote):
+    -- a real foreground report for an app we did not launch supersedes ours.
+    Driver.C4Driver.handle_companion_message({ _i = "CurrentApp", _c = { app_id = "com.google.ios.youtube" } })
+    assert_eq(Driver.Companion.launch.pending, nil, "external app change abandons the pending launch")
 
-  assert_eq(Driver.Companion.sent_messages[2]._c._bundleID, "com.att.tv", "deferred retry directv launch")
+    -- The (now stale) confirm timer must not relaunch over the user's choice.
+    env.fire_last()
+    assert_eq(env.launch_count(), 1, "superseded launch is not retried")
+  end)
+end
 
-  C4 = old_c4
-  SetTimer = old_set_timer
-  CancelTimer = old_cancel_timer
-  Driver.Companion.client = old_client
-  Driver.C4MiniApps.last_launch_id = old_last_launch_id
-  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
-  Driver.C4MiniApps.pending_launch_retry_id = old_retry_id
+function tests.launch_superseded_via_airplay_mrp_channel()
+  run_launch_test(function(env)
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    -- Same supersession, but the observation arrives on the AirPlay/MRP channel.
+    Driver.C4Driver.handle_airplay_mrp_update({ app_bundle = "com.google.ios.youtube" })
+    assert_eq(Driver.Companion.launch.pending, nil, "MRP app change abandons the pending launch")
+    assert_eq(env.launch_count(), 1, "no relaunch after MRP supersession")
+  end)
+end
+
+function tests.launch_retries_on_timeout_then_gives_up()
+  run_launch_test(function(env)
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    assert_eq(env.launch_count(), 1, "one launch sent initially")
+
+    env.fire_last() -- confirm timeout -> retry (attempt 2)
+    assert_eq(env.launch_count(), 2, "timeout triggers one bounded retry")
+    assert(Driver.Companion.launch.pending ~= nil, "still pending after retry")
+
+    env.fire_last() -- second timeout -> give up (max_attempts reached)
+    assert_eq(env.launch_count(), 2, "no third attempt beyond max_attempts")
+    assert_eq(Driver.Companion.launch.pending, nil, "launch tracking cleared after giving up")
+  end)
+end
+
+function tests.launch_retries_on_explicit_rejection()
+  run_launch_test(function(env)
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    assert_eq(env.launch_count(), 1, "one launch sent initially")
+
+    Driver.C4Driver.on_launch_error("com.netflix.Netflix", "boom")
+    assert_eq(env.launch_count(), 2, "an _em rejection triggers a retry")
+  end)
+end
+
+function tests.launch_is_not_resurrected_across_reconnect()
+  run_launch_test(function(env)
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    assert_eq(env.launch_count(), 1, "one launch sent under the current session")
+
+    -- A reconnect bumps the session generation.
+    Driver.Companion.session_generation = Driver.Companion.session_generation + 1
+
+    -- The confirm timer from the previous session fires late; it must not relaunch.
+    env.fire_last()
+    assert_eq(env.launch_count(), 1, "stale launch is dropped, not replayed after reconnect")
+    assert_eq(Driver.Companion.launch.pending, nil, "stale launch tracking cleared")
+  end)
+end
+
+function tests.launch_is_not_queued_when_session_not_ready()
+  run_launch_test(function()
+    local client = Driver.CompanionClient.new({
+      credentials = Driver.Credentials.parse(table.concat({
+        Driver.Bytes.hex(string.rep("\x01", 32)),
+        Driver.Bytes.hex(string.rep("\x02", 32)),
+        Driver.Bytes.hex("ATV-ID"),
+        Driver.Bytes.hex("CLIENT-ID"),
+      }, ":")),
+      crypto = {
+        encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+        decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+      },
+      transport = { Write = function() end },
+    })
+    client.state = "DISCONNECTED"
+    client.connect = function() end
+    Driver.Companion.client = client
+
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    assert_eq(#client.pending_commands, 0, "a launch is never parked for a later flush")
+  end)
+end
+
+function tests.launch_publishes_current_app_only_on_confirmation()
+  run_launch_test(function()
+    Properties = { ["Current App"] = "com.apple.TVWatchList" }
+
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    assert_eq(Properties["Current App"], "com.apple.TVWatchList",
+      "issuing a launch does not change Current App")
+
+    Driver.C4Driver.confirm_launch("com.netflix.Netflix", "ack")
+    assert_eq(Properties["Current App"], "com.netflix.Netflix",
+      "confirmation publishes the launched app")
+  end)
+end
+
+function tests.abandoned_launch_leaves_current_app_untouched()
+  run_launch_test(function(env)
+    Properties = { ["Current App"] = "com.apple.TVWatchList" }
+
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+    env.fire_last() -- confirm timeout -> retry
+    env.fire_last() -- second timeout -> give up (abandoned)
+
+    assert_eq(Driver.Companion.launch.pending, nil, "launch abandoned after max attempts")
+    assert_eq(Properties["Current App"], "com.apple.TVWatchList",
+      "an abandoned launch never claims the app")
+  end)
 end
 
 function tests.mini_apps_and_companion_client_use_c4_wall_clock()
@@ -3461,7 +3579,9 @@ function tests.app_list_current_app_and_now_playing_are_published()
   assert_eq(Driver._test_storage.app_list["com.netflix.Netflix"], "Netflix", "persisted app list")
 
   Driver.C4Driver.launch_app("com.netflix.Netflix")
-  assert_eq(Properties["Current App"], "Netflix | com.netflix.Netflix", "current app uses app list name")
+  assert_eq(Properties["Current App"], nil, "launch does not publish Current App until confirmed")
+  Driver.C4Driver.confirm_launch("com.netflix.Netflix", "ack")
+  assert_eq(Properties["Current App"], "Netflix | com.netflix.Netflix", "confirmed launch publishes app-list name")
 
   Driver.C4Driver.handle_companion_message({
     _i = "NowPlaying",

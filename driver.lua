@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.46-dev",
+  VERSION = "0.1.49-dev",
 }
 
 local function has_c4()
@@ -2762,6 +2762,21 @@ local Companion = {
   app_list = {},
   current_app = nil,
   now_playing = {},
+  -- Bumped each time a Companion session becomes ACTIVE. A launch records the
+  -- generation it was issued under; a confirm/retry that would fire under a
+  -- different generation is stale (a reconnect happened) and is dropped, so a
+  -- launch can never be resurrected across a disconnect.
+  session_generation = 0,
+  -- Deterministic launch confirmation. A launch is confirmed by an ack to the
+  -- _launchApp request or by a foreground event naming the target; only an
+  -- explicit failure or a confirm timeout triggers a bounded, same-session
+  -- retry. See C4Driver.start_launch and friends.
+  launch = {
+    timer = "AppleTV_launch_confirm",
+    confirm_timeout_ms = 5000,
+    max_attempts = 2,
+    pending = nil,
+  },
 }
 
 function Companion.record_sent_message(request)
@@ -3310,11 +3325,13 @@ function Companion.set_current_app(bundle_id_or_url)
   return app
 end
 
-function Companion.launch_app(bundle_id_or_url)
+function Companion.launch_app(bundle_id_or_url, options)
   assert(type(bundle_id_or_url) == "string" and bundle_id_or_url ~= "", "bundle id or URL required")
   local key = string.match(bundle_id_or_url, "^[%a][%w+.-]*:") and "_urlS" or "_bundleID"
-  Companion.set_current_app(bundle_id_or_url)
-  return Companion.send_opack("_launchApp", { [key] = bundle_id_or_url }, 2)
+  -- "Current App" is not set optimistically here: it is published only once the
+  -- launch is confirmed (see C4Driver.confirm_launch), so an abandoned launch
+  -- never leaves the property claiming an app that never came up.
+  return Companion.send_opack("_launchApp", { [key] = bundle_id_or_url }, 2, options)
 end
 
 function Companion.fetch_apps()
@@ -3489,6 +3506,10 @@ function Companion.update_from_message(message)
       name = app_name or Companion.app_name_for_bundle(app_id) or app_id,
     }
     changed.current_app = true
+    -- A genuine device report of the foreground app (not the value we set
+    -- optimistically at launch time). Only this is trustworthy for confirming a
+    -- pending launch.
+    changed.observed_app = app_id or app_name
   end
 
   local title = content.title or content._title
@@ -3647,6 +3668,11 @@ function CompanionClient:clear_runtime_state(options)
   self.pending_responses = {}
   if options.clear_pending_commands then
     self.pending_commands = {}
+  end
+  -- A launch that was still awaiting confirmation does not survive a session
+  -- teardown; the reconnect will start a fresh generation.
+  if C4Driver and C4Driver.reset_launch then
+    C4Driver.reset_launch("session teardown")
   end
 end
 
@@ -3946,7 +3972,9 @@ function CompanionClient:start_session()
     self.session_start_xid = nil
     self:set_state("SESSION_ACTIVE")
     self.session_active_since_ms = self:now_ms()
-    Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid))
+    Companion.session_generation = (Companion.session_generation or 0) + 1
+    Log.debug("Companion session active, remote_sid=" .. tostring(self.session_remote_sid) ..
+      " generation=" .. tostring(Companion.session_generation))
     self:send_next_startup_step()
   end, nil, request)
   return request
@@ -3964,7 +3992,6 @@ function CompanionClient:finish_tv_remote_control_session(xid, reason)
     Log.debug("Companion TV RC session continuing: " .. tostring(reason))
   end
   self:flush_pending_commands({ priority_only = true })
-  C4MiniApps.schedule_pending_launch_retry()
   self:send_next_startup_step()
 end
 
@@ -4266,7 +4293,19 @@ function CompanionClient:send_or_queue_opack(identifier, content, message_type, 
   local request = Companion.build_request(identifier, content, message_type)
   Companion.record_sent_message(request)
   if self:is_ready_for_commands() then
-    return self:send_opack(identifier, content, message_type, nil, nil, request)
+    return self:send_opack(identifier, content, message_type, options.on_response, options.on_error, request)
+  end
+  if options.no_queue then
+    -- Point-in-time command (e.g. a launch): do not park it for a later flush.
+    -- Replaying it after a reconnect minutes later could clobber whatever the
+    -- user has since put on screen. Kick a reconnect and let the caller's own
+    -- confirm/retry decide what to do.
+    Log.debug("Companion request not queued (point-in-time): " .. tostring(identifier) ..
+      "; session not ready")
+    if self:needs_reconnect() and not self.connecting then
+      self:connect()
+    end
+    return request, nil
   end
   Log.debug("queued Companion request until session active: " .. tostring(identifier))
   self:queue_pending_command({
@@ -4351,9 +4390,6 @@ C4MiniApps = {
   },
   bindings = {},
   pending_retry = nil,
-  launch_retry_timer = "AppleTV_miniapp_launch_retry",
-  launch_retry_delay_ms = 1500,
-  launch_retry_window_ms = 5000,
   launch_debounce_ms = 1000,
   native_handoff_timer = "AppleTV_native_driver_handoff",
   native_handoff_delay_ms = 750,
@@ -4874,73 +4910,6 @@ function C4MiniApps.after_launch_selection(app_proxy_id)
   C4MiniApps.reselect_passthrough_if_needed(app_proxy_id)
 end
 
-function C4MiniApps.is_startup_launch_window()
-  local client = Companion.client
-  if not client then
-    return false
-  end
-  if client.startup_in_progress then
-    return true
-  end
-  local active_since = client.session_active_since_ms
-  if not active_since then
-    return false
-  end
-  local age = C4MiniApps.now_ms() - active_since
-  return age >= 0 and age <= C4MiniApps.launch_retry_window_ms
-end
-
-function C4MiniApps.cancel_launch_retry()
-  if C4Driver and C4Driver.cancel_timer then
-    C4Driver.cancel_timer(C4MiniApps.launch_retry_timer)
-  end
-  C4MiniApps.pending_launch_retry_id = nil
-end
-
-function C4MiniApps.schedule_launch_retry(launch_id)
-  if not C4MiniApps.is_startup_launch_window() then
-    return false
-  end
-  if not (has_c4() and type(SetTimer) == "function") then
-    return false
-  end
-  C4MiniApps.cancel_launch_retry()
-  C4MiniApps.pending_launch_retry_id = launch_id
-  local ok, err = pcall(SetTimer, C4MiniApps.launch_retry_timer, C4MiniApps.launch_retry_delay_ms, function()
-    if C4MiniApps.pending_launch_retry_id ~= launch_id then
-      return
-    end
-    C4MiniApps.pending_launch_retry_id = nil
-    Log.debug("retry mini app launch after startup " .. tostring(launch_id))
-    C4Driver.launch_app(launch_id)
-  end)
-  if not ok then
-    C4MiniApps.pending_launch_retry_id = nil
-    Log.debug("mini app launch retry timer unavailable: " .. tostring(err))
-    return false
-  end
-  Log.debug("scheduled mini app launch retry " .. tostring(launch_id) ..
-    " in " .. tostring(C4MiniApps.launch_retry_delay_ms) .. "ms")
-  return true
-end
-
-function C4MiniApps.request_launch_retry(launch_id)
-  if C4MiniApps.schedule_launch_retry(launch_id) then
-    return true
-  end
-  C4MiniApps.pending_launch_retry_id = launch_id
-  Log.debug("pending mini app launch retry after startup " .. tostring(launch_id))
-  return false
-end
-
-function C4MiniApps.schedule_pending_launch_retry()
-  local launch_id = C4MiniApps.pending_launch_retry_id
-  if not launch_id then
-    return false
-  end
-  return C4MiniApps.schedule_launch_retry(launch_id)
-end
-
 function C4MiniApps.launch_service(service, app_proxy_id, options)
   options = options or {}
   local launch_id = C4MiniApps.resolve_launch_id(service)
@@ -4949,14 +4918,10 @@ function C4MiniApps.launch_service(service, app_proxy_id, options)
       C4MiniApps.after_launch_selection(app_proxy_id)
       return nil
     end
-    if C4MiniApps.pending_launch_retry_id and C4MiniApps.pending_launch_retry_id ~= launch_id then
-      C4MiniApps.cancel_launch_retry()
-    end
     Log.debug("launch mini app " .. launch_id)
+    -- Confirmation and any retry are owned by C4Driver.start_launch; the mini
+    -- app path just issues the launch.
     local request, frame = C4Driver.launch_app(launch_id)
-    if not options.retry then
-      C4MiniApps.request_launch_retry(launch_id)
-    end
     C4MiniApps.after_launch_selection(app_proxy_id)
     return request, frame
   end
@@ -6634,6 +6599,9 @@ function C4Driver.handle_companion_message(message)
   if changed.current_app then
     C4Driver.publish_current_app()
   end
+  if changed.observed_app then
+    C4Driver.note_current_app_observed(changed.observed_app)
+  end
   if changed.now_playing then
     C4Driver.publish_now_playing()
   end
@@ -6651,6 +6619,7 @@ function C4Driver.handle_airplay_mrp_update(update)
       name = Companion.app_name_for_bundle(identifier) or update.app_name or identifier,
     }
     C4Driver.publish_current_app()
+    C4Driver.note_current_app_observed(identifier)
     if changed_app and not (update.title or update.artist or update.album) then
       Companion.now_playing = {}
       C4Driver.publish_now_playing()
@@ -6671,9 +6640,137 @@ function C4Driver.launch_app(bundle_id_or_url)
     C4Driver.ensure_companion_client()
   end
   C4Driver.ensure_airplay_monitor_for_room("launch app")
-  local request, frame = Companion.launch_app(bundle_id_or_url)
-  C4Driver.publish_current_app()
+  return C4Driver.start_launch(bundle_id_or_url)
+end
+
+-- Deterministic launch. Send _launchApp once and wait for confirmation: an ack
+-- to the request, or a foreground event naming the target. Only an explicit
+-- rejection or a confirm timeout triggers a retry, and retries are bounded and
+-- scoped to the session generation that issued the launch -- so a launch is
+-- never resurrected across a reconnect, and a confirmed launch never fires
+-- again (which is what used to clobber an app the user had switched to
+-- out-of-band via voice or the Apple TV remote).
+function C4Driver.start_launch(target)
+  Companion.launch.pending = {
+    target = target,
+    attempts = 1,
+    generation = Companion.session_generation or 0,
+    confirmed = false,
+  }
+  Log.debug(string.format("launch start: target=%s attempt=1/%d gen=%d",
+    tostring(target), Companion.launch.max_attempts, Companion.launch.pending.generation))
+  local request, frame = C4Driver.send_launch(target)
+  C4Driver.arm_launch_confirm()
   return request, frame
+end
+
+-- Send the _launchApp frame with ack handlers. no_queue keeps it point-in-time:
+-- if the session is not ready it is not parked for a later flush.
+function C4Driver.send_launch(target)
+  return Companion.launch_app(target, {
+    no_queue = true,
+    on_response = function()
+      C4Driver.confirm_launch(target, "ack")
+    end,
+    on_error = function(message)
+      C4Driver.on_launch_error(target, message and message._em)
+    end,
+  })
+end
+
+function C4Driver.arm_launch_confirm()
+  local pending = Companion.launch.pending
+  if not pending then return end
+  C4Driver.cancel_timer(Companion.launch.timer)
+  if not (has_c4() and type(SetTimer) == "function") then return end
+  local generation, attempt = pending.generation, pending.attempts
+  local ok, err = pcall(SetTimer, Companion.launch.timer, Companion.launch.confirm_timeout_ms, function()
+    C4Driver.on_launch_timeout(generation, attempt)
+  end)
+  if not ok then
+    Log.debug("launch confirm timer unavailable: " .. tostring(err))
+  end
+end
+
+function C4Driver.on_launch_timeout(generation, attempt)
+  local pending = Companion.launch.pending
+  if not pending or pending.confirmed then return end
+  -- Ignore a timer left over from a superseded attempt.
+  if pending.generation ~= generation or pending.attempts ~= attempt then return end
+  if (Companion.session_generation or 0) ~= generation then
+    return C4Driver.reset_launch("session changed before confirm")
+  end
+  Log.debug("launch unconfirmed within " .. tostring(Companion.launch.confirm_timeout_ms) ..
+    "ms: target=" .. tostring(pending.target))
+  C4Driver.retry_launch("timeout")
+end
+
+function C4Driver.on_launch_error(target, err_message)
+  local pending = Companion.launch.pending
+  if not pending or pending.confirmed or pending.target ~= target then return end
+  Log.debug("launch rejected by Apple TV: target=" .. tostring(target) ..
+    " error=" .. tostring(err_message))
+  C4Driver.retry_launch("error")
+end
+
+-- Confirmation from either signal (ack or foreground event). First one wins;
+-- once confirmed the launch is done and can never retry.
+function C4Driver.confirm_launch(target, reason)
+  local pending = Companion.launch.pending
+  if not pending or pending.confirmed or pending.target ~= target then return end
+  pending.confirmed = true
+  Log.debug("launch confirmed (" .. tostring(reason) .. "): target=" .. tostring(target))
+  -- Publish "Current App" only now that we have evidence the launch took (an
+  -- ack, or a foreground event). The foreground path has already set current_app
+  -- to the same value; re-affirming it here covers ack-first confirmation.
+  Companion.set_current_app(target)
+  C4Driver.publish_current_app()
+  C4Driver.reset_launch("confirmed")
+end
+
+function C4Driver.retry_launch(reason)
+  local pending = Companion.launch.pending
+  if not pending or pending.confirmed then return end
+  if pending.attempts >= Companion.launch.max_attempts then
+    Log.debug(string.format("launch giving up after %d attempt(s) (%s): target=%s",
+      pending.attempts, tostring(reason), tostring(pending.target)))
+    return C4Driver.reset_launch("exhausted")
+  end
+  pending.attempts = pending.attempts + 1
+  Log.debug(string.format("launch retry %d/%d (%s): target=%s",
+    pending.attempts, Companion.launch.max_attempts, tostring(reason), tostring(pending.target)))
+  C4Driver.send_launch(pending.target)
+  C4Driver.arm_launch_confirm()
+end
+
+function C4Driver.reset_launch(reason)
+  if Companion.launch.pending then
+    Log.debug("launch tracking cleared (" .. tostring(reason) .. "): target=" ..
+      tostring(Companion.launch.pending.target))
+  end
+  Companion.launch.pending = nil
+  C4Driver.cancel_timer(Companion.launch.timer)
+end
+
+-- A genuine device report of the foreground app (from a Companion CurrentApp/
+-- _iMC event or an AirPlay MRP update) confirms a pending launch when it names
+-- the target. Callers pass the observed identifier, not the optimistic value
+-- set at send time, so a launch is only ever confirmed by real evidence.
+function C4Driver.note_current_app_observed(observed_identifier)
+  local pending = Companion.launch.pending
+  if not pending or pending.confirmed then return end
+  if not observed_identifier or observed_identifier == "" then return end
+  if observed_identifier == pending.target then
+    C4Driver.confirm_launch(pending.target, "foreground")
+  else
+    -- A real foreground report (from either the Companion or the AirPlay/MRP
+    -- channel) for an app we did not launch means the user moved on out-of-band
+    -- (voice, the Apple TV remote). Abandon our pending launch rather than retry
+    -- it over their choice.
+    Log.debug("launch superseded by external app change: pending=" ..
+      tostring(pending.target) .. " observed=" .. tostring(observed_identifier))
+    C4Driver.reset_launch("superseded")
+  end
 end
 
 function C4Driver.refresh_app_list()
@@ -7330,7 +7427,7 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
-  C4Driver.cancel_timer(C4MiniApps.launch_retry_timer)
+  C4Driver.cancel_timer(Companion.launch.timer)
   MDNS.cancel_all()
 end
 
