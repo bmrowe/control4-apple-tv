@@ -70,6 +70,41 @@ function Log.output(message)
   end
 end
 
+-- A refused connection is the normal state for a sleeping Apple TV, so it is
+-- reported once per episode rather than once per attempt. `owner` holds the
+-- counter and must outlive the per-session state, which is cleared on error.
+local Refused = {}
+Refused.ECONNREFUSED = "111"
+
+function Refused.matches(err_code)
+  return tostring(err_code) == Refused.ECONNREFUSED
+end
+
+function Refused.note_error(owner, label, err_code, err_msg)
+  local message = tostring(label) .. " TCP error: code=" .. tostring(err_code) ..
+    " message=" .. tostring(err_msg)
+  if not Refused.matches(err_code) then
+    owner.refused_attempts = 0
+    Log.error(message)
+    return
+  end
+  owner.refused_attempts = (owner.refused_attempts or 0) + 1
+  if owner.refused_attempts == 1 then
+    Log.error(message .. " (expected while the Apple TV is asleep; further " ..
+      "refusals log at debug until it accepts a connection)")
+  else
+    Log.debug(message .. " attempt=" .. tostring(owner.refused_attempts))
+  end
+end
+
+function Refused.note_connected(owner, label)
+  local attempts = owner.refused_attempts or 0
+  owner.refused_attempts = 0
+  if attempts == 0 then return end
+  Log.output(tostring(label) .. " TCP connection accepted after " ..
+    tostring(attempts) .. " refused attempt(s)")
+end
+
 local Bytes = {}
 
 function Bytes.byte(value)
@@ -621,6 +656,17 @@ function CompanionFrame.encode(frame_type, payload)
   assert(type(frame_type) == "number", "frame_type must be a number")
   assert(type(payload) == "string", "payload must be a string")
   return string.char(frame_type) .. Bytes.u24be(#payload) .. payload
+end
+
+-- Returns a message rather than raising, so the caller can drop the misframed
+-- buffer first.
+function CompanionFrame.oversized_frame_error(buffer, max_bytes, label)
+  if #buffer < 4 then return nil end
+  if not (max_bytes and max_bytes > 0) then return nil end
+  local declared = 4 + Bytes.read_u24be(buffer, 2)
+  if declared <= max_bytes then return nil end
+  return tostring(label or "Companion") .. " frame declares " .. tostring(declared) ..
+    " bytes, above the " .. tostring(max_bytes) .. " byte limit"
 end
 
 function CompanionFrame.name(frame_type)
@@ -2754,9 +2800,17 @@ local Companion = {
   sent_messages = {},
   sent_messages_max = 100,
   pending_commands_max = 50,
-  receive_buffer_max = 65536,
+  -- Bounds one frame, not one read. Kept modest because the receive accumulator
+  -- is a plain string concat, so a large ceiling costs quadratic copying.
+  max_frame_bytes = 262144,
   watchdog_interval_ms = 60000,
+  -- Applies only before the session carries commands; after that silence is
+  -- normal and the keepalive governs.
   watchdog_stale_ms = 90000,
+  keepalive_idle_ms = 120000,
+  -- Not a multiple of watchdog_interval_ms: on the tick boundary detection
+  -- slips an extra tick.
+  keepalive_timeout_ms = 45000,
   credentials = nil,
   client = nil,
   app_list = {},
@@ -2767,6 +2821,12 @@ local Companion = {
   -- different generation is stale (a reconnect happened) and is dropped, so a
   -- launch can never be resurrected across a disconnect.
   session_generation = 0,
+  -- A flag rather than a queued HID command: queued commands survive
+  -- reconnects, so an unreachable Apple TV would replay the tap later.
+  menu_tap_on_select_pending = false,
+  -- ON arrives several times per user action (room select plus source select).
+  menu_tap_debounce_ms = 3000,
+  menu_tap_last_at_ms = nil,
   -- Deterministic launch confirmation. A launch is confirmed by an ack to the
   -- _launchApp request or by a foreground event naming the target; only an
   -- explicit failure or a confirm timeout triggers a bounded, same-session
@@ -2811,6 +2871,8 @@ local AirPlay = {
   -- pair-verify every 15s forever is a lot of controller work for nothing.
   monitor_retry_max_ms = 300000,
   monitor_retry_attempts = 0,
+  monitor_stall_logged = false,
+  refused_attempts = 0,
   -- Covers the whole "starting -> tunnel up" window (discovery + TCP + HAP
   -- pair-verify). Nothing else guards that stretch, so a start that never calls
   -- back used to strand the monitor in DISCOVERING forever.
@@ -3664,6 +3726,7 @@ function CompanionClient:clear_runtime_state(options)
   self.post_session_started = false
   self.tv_rc_session_xid = nil
   self.session_active_since_ms = nil
+  self.keepalive_sent_at_ms = nil
   self.buffer = ""
   self.pending_responses = {}
   if options.clear_pending_commands then
@@ -3837,12 +3900,11 @@ function CompanionClient:connect(host, port)
       self:set_state((err_code and err_code ~= 0) and ("DISCONNECTED: " .. tostring(err_msg)) or "DISCONNECTED")
     end)
     :OnError(function(_, err_code, err_msg)
-      Log.error("Companion TCP error: code=" .. tostring(err_code) ..
-        " message=" .. tostring(err_msg))
+      Refused.note_error(self, "Companion", err_code, err_msg)
       self.transport = nil
       self:clear_runtime_state({ clear_pending_commands = false })
       self:set_state("ERROR: " .. tostring(err_code) .. " " .. tostring(err_msg))
-      if tostring(err_code) == "111" and self.on_connection_refused then
+      if Refused.matches(err_code) and self.on_connection_refused then
         self.on_connection_refused(self, err_code, err_msg)
       end
     end)
@@ -3856,6 +3918,7 @@ function CompanionClient:on_connected(transport)
   self.transport = transport
   self.connecting = false
   self.connected = true
+  Refused.note_connected(self, "Companion")
   self._port_rediscover_attempted = false
   self.last_rx_ms = nil
   self.last_tx_ms = nil
@@ -3884,8 +3947,8 @@ function CompanionClient:enable_session(keys)
   self:start_companion_services()
 end
 
-function CompanionClient:send_system_info()
-  return self:send_opack("_systemInfo", {
+function CompanionClient:system_info_content()
+  return {
     _bf = 0,
     _cf = 512,
     _clFl = 128,
@@ -3896,9 +3959,35 @@ function CompanionClient:send_system_info()
     _sv = Driver.VERSION,
     model = "Control4",
     name = "Control4",
-  }, 2, function()
+  }
+end
+
+function CompanionClient:send_system_info()
+  return self:send_opack("_systemInfo", self:system_info_content(), 2, function()
     self:send_next_startup_step()
   end)
+end
+
+-- Companion has no protocol-level ping. _systemInfo is the cheapest request the
+-- Apple TV answers and is a pure announcement, so repeating it changes nothing.
+function CompanionClient:send_keepalive()
+  if not self:is_ready_for_commands() then return false end
+  self.keepalive_sent_at_ms = self:now_ms()
+  local ok, err = pcall(function()
+    -- on_error so a rejected probe does not put the session into ERROR; any
+    -- response at all already proves the Apple TV is alive.
+    self:send_opack("_systemInfo", self:system_info_content(), 2, nil, function(message)
+      Log.debug("Companion keepalive rejected: " .. tostring(message and message._em))
+    end)
+  end)
+  if not ok then
+    -- Leave keepalive_sent_at_ms set; the next tick tears down on the
+    -- unanswered probe.
+    Log.debug("Companion keepalive send failed: " .. tostring(err))
+    return false
+  end
+  Log.debug("Companion keepalive sent")
+  return true
 end
 
 function CompanionClient:start_touch()
@@ -3918,7 +4007,7 @@ function CompanionClient:start_companion_services()
   end
   if self.state == "SESSION_ACTIVE" then
     Log.debug("Companion startup skipped: session already active")
-    self:flush_pending_commands()
+    self:on_ready_for_commands()
     return
   end
   self.startup_in_progress = true
@@ -3946,7 +4035,14 @@ function CompanionClient:send_next_startup_step()
   self.startup_steps = nil
   self.startup_index = 0
   self.startup_in_progress = false
+  self:on_ready_for_commands()
+end
+
+function CompanionClient:on_ready_for_commands()
   self:flush_pending_commands()
+  if C4Driver and C4Driver.flush_menu_tap_on_select then
+    C4Driver.flush_menu_tap_on_select()
+  end
 end
 
 function CompanionClient:start_session()
@@ -4040,12 +4136,18 @@ end
 function CompanionClient:receive(data)
   self:mark_rx()
   self.buffer = self.buffer .. (data or "")
-  enforce_buffer_limit(self, "buffer", Companion.receive_buffer_max, "Companion receive buffer")
   if Log.is_debug() then
     Log.debug("Companion receive buffered: buffer_len=" .. tostring(#self.buffer) ..
       " encrypted_session=" .. tostring(self.session ~= nil))
   end
   while true do
+    -- Both decoders read the same 4-byte header, so one check covers both.
+    local oversized = CompanionFrame.oversized_frame_error(self.buffer,
+      Companion.max_frame_bytes, "Companion receive")
+    if oversized then
+      self.buffer = ""
+      error(oversized)
+    end
     local frame
     if self.session then
       frame, self.buffer = self.session:try_decode(self.buffer)
@@ -4053,6 +4155,9 @@ function CompanionClient:receive(data)
       frame, self.buffer = CompanionFrame.try_decode(self.buffer)
     end
     if not frame then
+      -- Unreachable given the header check above; here so a framing bug
+      -- degrades to a reconnect instead of unbounded memory.
+      enforce_buffer_limit(self, "buffer", Companion.max_frame_bytes, "Companion receive buffer")
       if Log.is_debug() then
         Log.debug("Companion receive waiting for complete frame: buffer_len=" .. tostring(#self.buffer))
       end
@@ -5164,9 +5269,11 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
       C4Driver.connect_companion()
     end
     C4Driver.ensure_airplay_monitor_for_room("room on")
+    C4Driver.request_menu_tap_on_select()
     return
   end
   if command == "OFF" then
+    C4Driver.cancel_menu_tap_on_select("room off")
     local mapped_hid, mapped_action, handled_mapping = C4MiniApps.mapped_button_action(command, params._resolved_action)
     if handled_mapping and mapped_hid then
       if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
@@ -6252,6 +6359,7 @@ function AirPlayControlClient:connect(host, port)
   client = C4:CreateTCPClient()
     :OnConnect(function(tcp_client)
       Log.debug("AirPlay control TCP connected")
+      Refused.note_connected(AirPlay, "AirPlay control")
       self:on_connected(tcp_client)
       tcp_client:ReadUpTo(4096)
     end)
@@ -6280,8 +6388,9 @@ function AirPlayControlClient:connect(host, port)
     end)
     :OnError(function(_, err_code, err_msg)
       if self.closed then return end
-      Log.error("AirPlay control TCP error: code=" .. tostring(err_code) ..
-        " message=" .. tostring(err_msg))
+      -- Counter lives on AirPlay, not self: the monitor builds a fresh control
+      -- client per retry.
+      Refused.note_error(AirPlay, "AirPlay control", err_code, err_msg)
       self.transport = nil
       self.connecting = false
       self.connected = false
@@ -6796,10 +6905,17 @@ function C4Driver.airplay_monitor_retry_delay_ms()
   return math.min(delay, AirPlay.monitor_retry_max_ms)
 end
 
-function C4Driver.airplay_monitor_retry_succeeded()
-  AirPlay.monitor_retry_attempts = 0
+-- Leaves the attempt counter alone: a tunnel that comes up and drops seconds
+-- later must not reset the backoff, or it never converges.
+function C4Driver.airplay_monitor_connected()
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
+end
+
+function C4Driver.airplay_monitor_retry_succeeded()
+  AirPlay.monitor_retry_attempts = 0
+  AirPlay.monitor_stall_logged = false
+  C4Driver.airplay_monitor_connected()
 end
 
 -- Guards the window between "start requested" and "tunnel up". Every other path
@@ -6812,8 +6928,16 @@ function C4Driver.schedule_airplay_monitor_start_watchdog()
     AirPlay.monitor_start_timeout_ms, function()
       if not AirPlay.monitor_enabled then return end
       if AirPlay.monitor_state == "ACTIVE" then return end
-      Log.error("AirPlay monitor start stalled in state " ..
-        tostring(AirPlay.monitor_state) .. "; retrying")
+      -- An Apple TV that is off stalls every start attempt, so report the
+      -- transition once rather than every timeout.
+      local message = "AirPlay monitor start stalled in state " ..
+        tostring(AirPlay.monitor_state) .. "; retrying"
+      if AirPlay.monitor_stall_logged then
+        Log.debug(message)
+      else
+        AirPlay.monitor_stall_logged = true
+        Log.error(message)
+      end
       C4Driver.schedule_airplay_monitor_retry("start stalled")
     end)
   if not ok then
@@ -6841,8 +6965,56 @@ function C4Driver.schedule_airplay_monitor_retry(reason)
   end
 end
 
+C4Driver.menu_tap_property = "Send Menu Tap on ON"
+
+function C4Driver.menu_tap_on_select_enabled()
+  local configured = Properties and Properties[C4Driver.menu_tap_property]
+  return tostring(configured or "False") == "True"
+end
+
+-- Wakes a sleeping Apple TV and clears the screensaver. Off by default: on an
+-- awake Apple TV the tap is a real navigation event.
+function C4Driver.request_menu_tap_on_select()
+  if not C4Driver.menu_tap_on_select_enabled() then return false end
+  local now = C4Driver.now_ms()
+  local last = Companion.menu_tap_last_at_ms
+  if last and (now - last) >= 0 and (now - last) < (Companion.menu_tap_debounce_ms or 0) then
+    Log.debug("Menu tap on select suppressed: duplicate ON")
+    return false
+  end
+  Companion.menu_tap_last_at_ms = now
+  Companion.menu_tap_on_select_pending = true
+  C4Driver.flush_menu_tap_on_select()
+  return true
+end
+
+function C4Driver.flush_menu_tap_on_select()
+  if not Companion.menu_tap_on_select_pending then return false end
+  local client = Companion.client
+  if not (client and client.is_ready_for_commands and client:is_ready_for_commands()) then
+    return false
+  end
+  Companion.menu_tap_on_select_pending = false
+  Log.debug("sending Menu tap on device select")
+  Companion.button_action("MENU", nil, { priority = true })
+  return true
+end
+
+function C4Driver.cancel_menu_tap_on_select(reason)
+  if not Companion.menu_tap_on_select_pending then return false end
+  Companion.menu_tap_on_select_pending = false
+  Log.debug("pending Menu tap on select dropped: " .. tostring(reason or "deselected"))
+  return true
+end
+
 function C4Driver.ensure_airplay_monitor_for_room(reason)
   if AirPlay.monitor_enabled then
+    -- Room activity means the Apple TV is awake, so drop back to the floor
+    -- delay. Guarded on attempts > 1 so button presses cannot starve the retry.
+    if AirPlay.monitor_state ~= "ACTIVE" and (AirPlay.monitor_retry_attempts or 0) > 1 then
+      AirPlay.monitor_retry_attempts = 0
+      C4Driver.schedule_airplay_monitor_retry(reason or "room activity")
+    end
     return
   end
   if not (AirPlay.credentials or (Driver.state and Driver.state.airplay_credentials)) then
@@ -6900,6 +7072,9 @@ function C4Driver.check_airplay_monitor_watchdog()
     C4Driver.schedule_airplay_monitor_retry(err or "heartbeat failed")
     return
   end
+  -- Earliest point the tunnel is worth calling stable: it survived a full
+  -- heartbeat interval and the heartbeat wrote cleanly.
+  C4Driver.airplay_monitor_retry_succeeded()
   C4Driver.schedule_airplay_monitor_watchdog()
 end
 
@@ -6936,7 +7111,7 @@ function C4Driver.start_airplay_monitor(reason)
       on_tunnel_setup = function(result)
         if result and result.data_port then
           Log.debug("AirPlay monitor active: dataPort=" .. tostring(result.data_port))
-          C4Driver.airplay_monitor_retry_succeeded()
+          C4Driver.airplay_monitor_connected()
           C4Driver.mark_airplay_monitor_activity("tunnel ready")
           C4Driver.schedule_airplay_monitor_watchdog()
         else
@@ -6983,6 +7158,7 @@ end
 function C4Driver.stop_airplay_monitor(reason)
   AirPlay.monitor_enabled = false
   AirPlay.monitor_retry_attempts = 0
+  AirPlay.monitor_stall_logged = false
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_retry")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
@@ -7214,6 +7390,7 @@ end
 
 function C4Driver.disconnect_companion()
   C4Driver.cancel_timer("AppleTV_companion_watchdog")
+  C4Driver.cancel_menu_tap_on_select("companion disconnected")
   MDNS.cancel_all()
   C4Driver.dispose_companion_client(Companion.client)
   C4Driver.stop_airplay_monitor("disconnect")
@@ -7253,6 +7430,27 @@ function C4Driver.schedule_companion_watchdog()
   end
 end
 
+function C4Driver.companion_watchdog_teardown(client, reason)
+  Log.debug("Companion watchdog " .. tostring(reason))
+  local ok, err = pcall(function()
+    client:close({ clear_pending_commands = false })
+  end)
+  if not ok then
+    Log.debug("Companion watchdog close failed: " .. tostring(err))
+    client.transport = nil
+    client:clear_runtime_state({ clear_pending_commands = false })
+    client:set_state("DISCONNECTED")
+  end
+  C4Driver.set_connection_state("DISCONNECTED")
+  if Companion.client == client and client.credentials and client.connect then
+    local reconnect_ok, reconnect_err = pcall(function() client:connect() end)
+    if not reconnect_ok then
+      Log.debug("Companion watchdog reconnect failed: " .. tostring(reconnect_err))
+    end
+  end
+  C4Driver.schedule_companion_watchdog()
+end
+
 function C4Driver.check_companion_watchdog()
   local client = Companion.client
   if not client then return end
@@ -7266,26 +7464,35 @@ function C4Driver.check_companion_watchdog()
     local now = C4Driver.now_ms()
     local last_activity = client.last_rx_ms or client.session_active_since_ms or client.last_tx_ms or 0
     local age = now - last_activity
-    if last_activity > 0 and age > Companion.watchdog_stale_ms then
-      Log.debug("Companion watchdog stale: state=" .. state .. " age_ms=" .. tostring(age))
-      local ok, err = pcall(function()
-        client:close({ clear_pending_commands = false })
-      end)
-      if not ok then
-        Log.debug("Companion watchdog close failed: " .. tostring(err))
-        client.transport = nil
-        client:clear_runtime_state({ clear_pending_commands = false })
-        client:set_state("DISCONNECTED")
-      end
-      C4Driver.set_connection_state("DISCONNECTED")
-      if Companion.client == client and client.credentials and client.connect then
-        local reconnect_ok, reconnect_err = pcall(function() client:connect() end)
-        if not reconnect_ok then
-          Log.debug("Companion watchdog reconnect failed: " .. tostring(reconnect_err))
-        end
+    local ready = client.is_ready_for_commands and client:is_ready_for_commands()
+
+    if not ready then
+      -- Nothing to probe with yet, and here silence does mean a stalled
+      -- handshake.
+      if last_activity > 0 and age > Companion.watchdog_stale_ms then
+        return C4Driver.companion_watchdog_teardown(client,
+          "startup stalled: state=" .. state .. " age_ms=" .. tostring(age))
       end
       C4Driver.schedule_companion_watchdog()
       return
+    end
+
+    -- An idle session is silent by design, so only an unanswered probe counts
+    -- as death.
+    local keepalive_at = client.keepalive_sent_at_ms
+    if keepalive_at and (client.last_rx_ms or 0) >= keepalive_at then
+      client.keepalive_sent_at_ms = nil
+      keepalive_at = nil
+    end
+
+    if keepalive_at then
+      local outstanding = now - keepalive_at
+      if outstanding > Companion.keepalive_timeout_ms then
+        return C4Driver.companion_watchdog_teardown(client,
+          "keepalive unanswered: outstanding_ms=" .. tostring(outstanding))
+      end
+    elseif last_activity > 0 and age >= Companion.keepalive_idle_ms then
+      client:send_keepalive()
     end
   end
 
@@ -7601,6 +7808,7 @@ end
 -- EC, OPC, OSE, OWVC, and RFP tables registered above.
 
 Driver.Log = Log
+Driver.Refused = Refused
 Driver.Bytes = Bytes
 Driver.MDNS = MDNS
 Driver.TLV8 = TLV8

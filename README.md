@@ -106,6 +106,9 @@ and Prime Video are also aliased.
 - `After Mini App Launch`: choose `Return To This Driver` or `Select Native Apple TV Driver`.
 - `Native Apple TV Driver`: native `appleTV.c4z` driver to select after a Mini App launch.
 - `Launch App`: dynamic app selector populated by `Refresh App List`.
+- `Send Menu Tap on ON`: send a Menu tap when the room selects this device, to wake a
+  sleeping Apple TV and dismiss the screensaver. Defaults to `False`, matching the native
+  driver — on an already-awake Apple TV the tap is a real navigation event.
 - `Pairing PIN`: enter Apple TV pairing PINs here.
 - `Debug Mode`: prints diagnostic logs to Lua output.
 

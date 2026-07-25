@@ -597,11 +597,75 @@ function tests.airplay_monitor_retry_backs_off_exponentially()
   assert_eq(seen[8], AirPlay.monitor_retry_max_ms, "retry delay is capped")
   assert_eq(seen[8] <= AirPlay.monitor_retry_max_ms, true, "never exceeds the cap")
 
-  -- A successful start clears the backoff so the next outage starts fast again.
   Driver.C4Driver.airplay_monitor_retry_succeeded()
   assert_eq(AirPlay.monitor_retry_attempts, 0, "success resets the backoff")
 
   AirPlay.monitor_retry_attempts = saved_attempts
+end
+
+function tests.airplay_monitor_backoff_survives_an_unstable_tunnel()
+  local AirPlay = Driver.AirPlay
+  local saved_attempts = AirPlay.monitor_retry_attempts
+  AirPlay.monitor_retry_attempts = 3
+
+  Driver.C4Driver.airplay_monitor_connected()
+  assert_eq(AirPlay.monitor_retry_attempts, 3,
+    "tunnel setup alone does not reset the backoff")
+  assert_eq(Driver.C4Driver.airplay_monitor_retry_delay_ms(), 60000,
+    "delay keeps growing across flapping sessions")
+
+  Driver.C4Driver.airplay_monitor_retry_succeeded()
+  assert_eq(AirPlay.monitor_retry_attempts, 0, "a stable session resets the backoff")
+
+  AirPlay.monitor_retry_attempts = saved_attempts
+end
+
+function tests.connection_refused_logs_once_per_state_transition()
+  local Log = Driver.Log
+  local saved = { error = Log.error, debug = Log.debug, output = Log.output }
+  local errors, debugs, outputs = {}, {}, {}
+  Log.error = function(m) errors[#errors + 1] = tostring(m) end
+  Log.debug = function(m) debugs[#debugs + 1] = tostring(m) end
+  Log.output = function(m) outputs[#outputs + 1] = tostring(m) end
+
+  local owner = {}
+  local ok, err = pcall(function()
+    for _ = 1, 25 do
+      Driver.Refused.note_error(owner, "Companion", 111, "Connection refused")
+    end
+    Driver.Refused.note_connected(owner, "Companion")
+  end)
+
+  Log.error, Log.debug, Log.output = saved.error, saved.debug, saved.output
+  assert_eq(ok, true, "refused logging did not raise: " .. tostring(err))
+  assert_eq(#errors, 1, "25 refusals produce exactly one error line")
+  assert_eq(#debugs, 24, "repeat refusals stay at debug")
+  assert_eq(#outputs, 1, "recovery is reported once")
+  assert(errors[1]:find("Connection refused", 1, true), "error line keeps the socket message")
+  assert(outputs[1]:find("after 25 refused attempt", 1, true), "recovery reports the attempt count")
+  assert_eq(owner.refused_attempts, 0, "recovery clears the refused counter")
+end
+
+function tests.non_refused_socket_errors_still_log_every_time()
+  local Log = Driver.Log
+  local saved = { error = Log.error, debug = Log.debug, output = Log.output }
+  local errors, outputs = {}, {}
+  Log.error = function(m) errors[#errors + 1] = tostring(m) end
+  Log.debug = function() end
+  Log.output = function(m) outputs[#outputs + 1] = tostring(m) end
+
+  local owner = {}
+  local ok = pcall(function()
+    Driver.Refused.note_error(owner, "Companion", 113, "No route to host")
+    Driver.Refused.note_error(owner, "Companion", 113, "No route to host")
+    Driver.Refused.note_error(owner, "Companion", 111, "Connection refused")
+    Driver.Refused.note_connected(owner, "Companion")
+  end)
+
+  Log.error, Log.debug, Log.output = saved.error, saved.debug, saved.output
+  assert_eq(ok, true, "mixed socket errors did not raise")
+  assert_eq(#errors, 3, "unrelated socket errors are never suppressed")
+  assert_eq(#outputs, 1, "recovery still reported after the refused episode")
 end
 
 function tests.tlv8_roundtrip()
@@ -1624,6 +1688,143 @@ function tests.refresh_app_list_uses_existing_client()
   Properties = old_properties
 end
 
+local function menu_tap_env()
+  local writes = {}
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = { Write = function(_, data) writes[#writes + 1] = data end },
+  })
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "CONNECTED"
+  Driver.Companion.client = client
+  Driver.Companion.menu_tap_on_select_pending = false
+  Driver.Companion.menu_tap_last_at_ms = nil
+
+  local env = { client = client, writes = writes }
+
+  function env.hid_commands()
+    local found = {}
+    for _, data in ipairs(writes) do
+      local decoded = client.session:try_decode(data)
+      local message = decoded and Driver.OPACK.decode(decoded.payload)
+      if message and message._i == "_hidC" then
+        found[#found + 1] = message._c._hidC
+      end
+    end
+    return found
+  end
+
+  function env.restore()
+    Driver.Companion.client = nil
+    Driver.Companion.menu_tap_on_select_pending = false
+    Driver.Companion.menu_tap_last_at_ms = nil
+  end
+
+  return env
+end
+
+function tests.menu_tap_on_select_waits_for_session_then_sends()
+  local old_properties = Properties
+  Properties = { ["Send Menu Tap on ON"] = "True" }
+  local env = menu_tap_env()
+
+  local requested = Driver.C4Driver.request_menu_tap_on_select()
+  assert_eq(requested, true, "tap requested when the property is enabled")
+  assert_eq(Driver.Companion.menu_tap_on_select_pending, true, "tap held until session ready")
+  assert_eq(#env.hid_commands(), 0, "nothing sent before the session is ready")
+
+  env.client.state = "SESSION_ACTIVE"
+  env.client:on_ready_for_commands()
+
+  local hids = env.hid_commands()
+  assert_eq(#hids > 0, true, "Menu tap sent once the session is ready")
+  assert_eq(hids[1], 5, "the tap is the MENU HID command")
+  assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "pending intent consumed")
+
+  local before = #env.hid_commands()
+  env.client:on_ready_for_commands()
+  assert_eq(#env.hid_commands(), before, "tap is not resent on a later flush")
+
+  env.restore()
+  Properties = old_properties
+end
+
+function tests.menu_tap_on_select_is_off_by_default()
+  local old_properties = Properties
+  Properties = {}
+  local env = menu_tap_env()
+
+  local requested = Driver.C4Driver.request_menu_tap_on_select()
+  assert_eq(requested, false, "no tap when the property is unset")
+  assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "nothing pending")
+
+  env.client.state = "SESSION_ACTIVE"
+  env.client:on_ready_for_commands()
+  assert_eq(#env.hid_commands(), 0, "no HID traffic when disabled")
+
+  Properties = { ["Send Menu Tap on ON"] = "False" }
+  assert_eq(Driver.C4Driver.request_menu_tap_on_select(), false, "explicit False disables the tap")
+
+  env.restore()
+  Properties = old_properties
+end
+
+function tests.menu_tap_on_select_dropped_when_room_turns_off()
+  local old_properties = Properties
+  Properties = { ["Send Menu Tap on ON"] = "True" }
+  local env = menu_tap_env()
+
+  Driver.C4Driver.request_menu_tap_on_select()
+  assert_eq(Driver.Companion.menu_tap_on_select_pending, true, "tap pending while unreachable")
+
+  local cancelled = Driver.C4Driver.cancel_menu_tap_on_select("room off")
+  assert_eq(cancelled, true, "cancel reports it dropped a pending tap")
+  assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "pending tap dropped")
+
+  env.client.state = "SESSION_ACTIVE"
+  env.client:on_ready_for_commands()
+  assert_eq(#env.hid_commands(), 0, "no tap fires into a room that was turned off")
+
+  assert_eq(Driver.C4Driver.cancel_menu_tap_on_select("again"), false,
+    "cancelling with nothing pending is a no-op")
+
+  env.restore()
+  Properties = old_properties
+end
+
+function tests.menu_tap_on_select_debounces_duplicate_on()
+  local old_properties = Properties
+  local old_now_ms = Driver.C4Driver.now_ms
+  Properties = { ["Send Menu Tap on ON"] = "True" }
+  local env = menu_tap_env()
+
+  local now = 10000
+  Driver.C4Driver.now_ms = function() return now end
+  env.client.state = "SESSION_ACTIVE"
+
+  assert_eq(Driver.C4Driver.request_menu_tap_on_select(), true, "first ON taps")
+  now = now + 200
+  assert_eq(Driver.C4Driver.request_menu_tap_on_select(), false, "duplicate ON suppressed")
+  assert_eq(#env.hid_commands(), 2, "one tap is one press plus one release")
+
+  now = now + Driver.Companion.menu_tap_debounce_ms + 1
+  assert_eq(Driver.C4Driver.request_menu_tap_on_select(), true, "later ON taps again")
+  assert_eq(#env.hid_commands(), 4, "second tap delivered")
+
+  Driver.C4Driver.now_ms = old_now_ms
+  env.restore()
+  Properties = old_properties
+end
+
 function tests.queued_command_does_not_reenter_connect_while_connecting()
   local client = Driver.CompanionClient.new({
     credentials = Driver.Credentials.parse(table.concat({
@@ -1693,19 +1894,67 @@ function tests.queued_command_queue_is_bounded()
   assert_eq(client.pending_commands[3].content._bundleID, "app5", "newest queued command retained")
 end
 
-function tests.companion_receive_buffer_is_bounded()
-  local old_max = Driver.Companion.receive_buffer_max
-  Driver.Companion.receive_buffer_max = 8
+function tests.companion_receive_rejects_oversized_declared_frame_length()
+  local old_max = Driver.Companion.max_frame_bytes
+  Driver.Companion.max_frame_bytes = 64
   local client = Driver.CompanionClient.new({})
 
+  local header = string.char(Driver.CompanionFrame.E_OPACK) .. Driver.Bytes.u24be(4096)
+  local ok, err = pcall(function() client:receive(header) end)
+
+  Driver.Companion.max_frame_bytes = old_max
+  assert_eq(ok, false, "oversized declared frame length rejected")
+  assert(tostring(err):find("frame declares 4100 bytes", 1, true),
+    "error names the declared frame size")
+  assert_eq(client.buffer, "", "rejected frame clears the receive buffer")
+end
+
+function tests.companion_receive_tolerates_burst_larger_than_frame_cap()
+  local old_max = Driver.Companion.max_frame_bytes
+  Driver.Companion.max_frame_bytes = 256
+  local client = Driver.CompanionClient.new({})
+
+  local handled = {}
+  client.handle_frame = function(_, frame) handled[#handled + 1] = frame end
+
+  local frames = {}
+  for i = 1, 40 do
+    frames[#frames + 1] = Driver.CompanionFrame.encode(Driver.CompanionFrame.U_OPACK,
+      string.rep(string.char(i), 100))
+  end
+  local burst = table.concat(frames)
+  assert(#burst > Driver.Companion.max_frame_bytes,
+    "burst must exceed the single-frame cap for this test to mean anything")
+
+  local ok, err = pcall(function() client:receive(burst) end)
+
+  Driver.Companion.max_frame_bytes = old_max
+  assert_eq(ok, true, "burst of small frames accepted: " .. tostring(err))
+  assert_eq(#handled, 40, "every frame in the burst was parsed")
+  assert_eq(client.buffer, "", "burst fully drained")
+end
+
+function tests.companion_receive_keeps_partial_frame_after_burst()
+  local old_max = Driver.Companion.max_frame_bytes
+  Driver.Companion.max_frame_bytes = 256
+  local client = Driver.CompanionClient.new({})
+
+  local handled = {}
+  client.handle_frame = function(_, frame) handled[#handled + 1] = frame end
+
+  local whole = Driver.CompanionFrame.encode(Driver.CompanionFrame.U_OPACK, string.rep("a", 100))
+  local split = Driver.CompanionFrame.encode(Driver.CompanionFrame.U_OPACK, string.rep("b", 100))
+
   local ok, err = pcall(function()
-    client:receive(string.rep("x", 9))
+    client:receive(whole .. split:sub(1, 40))
+    client:receive(split:sub(41))
   end)
 
-  Driver.Companion.receive_buffer_max = old_max
-  assert_eq(ok, false, "oversized Companion receive buffer rejected")
-  assert(tostring(err):find("Companion receive buffer", 1, true), "Companion buffer error labels source")
-  assert_eq(client.buffer, "", "oversized Companion receive buffer cleared")
+  Driver.Companion.max_frame_bytes = old_max
+  assert_eq(ok, true, "split frame reassembled: " .. tostring(err))
+  assert_eq(#handled, 2, "both frames delivered once complete")
+  assert_eq(handled[2].payload, string.rep("b", 100), "reassembled payload intact")
+  assert_eq(client.buffer, "", "buffer drained after reassembly")
 end
 
 function tests.companion_dispose_clears_heavy_state_and_callbacks()
@@ -3762,50 +4011,151 @@ function tests.connection_state_also_publishes_companion_state()
   Properties = old_properties
 end
 
-function tests.companion_watchdog_reconnects_stale_session()
-  local old_properties = Properties
-  local old_client = Driver.Companion.client
-  local old_now = Driver.C4Driver.now_ms
-  local old_interval = Driver.Companion.watchdog_interval_ms
-  local old_stale = Driver.Companion.watchdog_stale_ms
-  local closed = false
-  local connect_calls = 0
+-- Restores globals through a pcall so a failing assertion cannot leak
+-- Companion.client or a frozen clock into later tests.
+local function with_watchdog_client(state, fields, body)
+  local saved = {
+    properties = Properties,
+    client = Driver.Companion.client,
+    now_ms = Driver.C4Driver.now_ms,
+  }
+  local env = { closed = false, connects = 0, keepalives = 0, now = 0 }
 
   Properties = {}
-  Driver.Companion.watchdog_interval_ms = 60000
-  Driver.Companion.watchdog_stale_ms = 60000
-  Driver.C4Driver.now_ms = function() return 120000 end
-  Driver.Companion.client = {
-    state = "SESSION_ACTIVE",
+  Driver.C4Driver.now_ms = function() return env.now end
+
+  local client = {
+    state = state,
     credentials = { type = "HAP" },
-    session = {},
-    transport = {
-      Close = function()
-        closed = true
-      end,
-    },
-    last_rx_ms = 1000,
-    pending_commands = {
-      { identifier = "_launchApp" },
-    },
+    transport = { Close = function() env.closed = true end },
+    pending_commands = { { identifier = "_launchApp" } },
+    pending_responses = {},
+    response_timeout_ms = 30000,
   }
-  setmetatable(Driver.Companion.client, { __index = Driver.CompanionClient })
-  Driver.Companion.client.connect = function(self)
-    connect_calls = connect_calls + 1
+  for key, value in pairs(fields or {}) do client[key] = value end
+  setmetatable(client, { __index = Driver.CompanionClient })
+  client.connect = function(self)
+    env.connects = env.connects + 1
     self.connecting = true
   end
+  -- The watchdog's decision is under test; send_keepalive is covered below.
+  client.send_keepalive = function(self)
+    env.keepalives = env.keepalives + 1
+    self.keepalive_sent_at_ms = Driver.C4Driver.now_ms()
+    return true
+  end
+  env.client = client
+  Driver.Companion.client = client
 
-  Driver.C4Driver.check_companion_watchdog()
-  assert_eq(closed, true, "stale Companion transport closed")
-  assert_eq(connect_calls, 1, "stale Companion reconnect requested")
-  assert_eq(#Driver.Companion.client.pending_commands, 1, "queued commands preserved")
-  assert_eq(Properties["Connection State"], "DISCONNECTED", "watchdog disconnect state")
+  local ok, err = pcall(body, env)
 
-  Properties = old_properties
+  Properties = saved.properties
+  Driver.Companion.client = saved.client
+  Driver.C4Driver.now_ms = saved.now_ms
+  if not ok then error(err, 2) end
+end
+
+function tests.companion_watchdog_probes_idle_session_instead_of_reconnecting()
+  with_watchdog_client("SESSION_ACTIVE", { session = {}, last_rx_ms = 1000 }, function(env)
+    env.now = 1000 + Driver.Companion.keepalive_idle_ms + 1
+
+    Driver.C4Driver.check_companion_watchdog()
+
+    assert_eq(env.keepalives, 1, "idle session probed")
+    assert_eq(env.closed, false, "idle session NOT torn down")
+    assert_eq(env.connects, 0, "no reconnect for an idle session")
+    assert_eq(Properties["Connection State"], nil, "connection state untouched")
+  end)
+end
+
+function tests.companion_watchdog_leaves_a_busy_session_alone()
+  with_watchdog_client("SESSION_ACTIVE", { session = {}, last_rx_ms = 1000 }, function(env)
+    env.now = 1000 + math.floor(Driver.Companion.keepalive_idle_ms / 2)
+
+    Driver.C4Driver.check_companion_watchdog()
+
+    assert_eq(env.keepalives, 0, "busy session is not probed")
+    assert_eq(env.closed, false, "busy session not torn down")
+  end)
+end
+
+function tests.companion_watchdog_clears_probe_when_traffic_resumes()
+  with_watchdog_client("SESSION_ACTIVE", { session = {} }, function(env)
+    env.client.keepalive_sent_at_ms = 5000
+    env.client.last_rx_ms = 5200
+    env.now = 5000 + Driver.Companion.keepalive_timeout_ms + 1
+
+    Driver.C4Driver.check_companion_watchdog()
+
+    assert_eq(env.client.keepalive_sent_at_ms, nil, "answered probe cleared")
+    assert_eq(env.closed, false, "session with fresh traffic not torn down")
+    assert_eq(env.connects, 0, "no reconnect when the probe was answered")
+  end)
+end
+
+function tests.companion_watchdog_reconnects_when_probe_goes_unanswered()
+  with_watchdog_client("SESSION_ACTIVE", { session = {} }, function(env)
+    env.client.keepalive_sent_at_ms = 5000
+    env.client.last_rx_ms = 1000
+    env.now = 5000 + Driver.Companion.keepalive_timeout_ms + 1
+
+    Driver.C4Driver.check_companion_watchdog()
+
+    assert_eq(env.closed, true, "dead session torn down")
+    assert_eq(env.connects, 1, "reconnect requested")
+    assert_eq(#env.client.pending_commands, 1, "queued commands preserved")
+    assert_eq(Properties["Connection State"], "DISCONNECTED", "watchdog disconnect state")
+  end)
+end
+
+function tests.companion_watchdog_still_unsticks_a_stalled_startup()
+  with_watchdog_client("SESSION_STARTING", { last_rx_ms = 1000 }, function(env)
+    env.now = 1000 + Driver.Companion.watchdog_stale_ms + 1
+
+    Driver.C4Driver.check_companion_watchdog()
+
+    assert_eq(env.keepalives, 0, "no probe before the session is ready")
+    assert_eq(env.closed, true, "stalled startup torn down")
+    assert_eq(env.connects, 1, "stalled startup reconnects")
+  end)
+end
+
+function tests.companion_keepalive_sends_system_info()
+  local old_client = Driver.Companion.client
+  local writes = {}
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = { Write = function(_, data) writes[#writes + 1] = data end },
+  })
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "SESSION_ACTIVE"
+
+  local ok, err = pcall(function()
+    assert_eq(client:send_keepalive(), true, "keepalive sent on a ready session")
+    assert_eq(#writes, 1, "keepalive wrote one frame")
+    local decoded = client.session:try_decode(writes[1])
+    local message = Driver.OPACK.decode(decoded.payload)
+    assert_eq(message._i, "_systemInfo", "keepalive probes with _systemInfo")
+    assert(client.keepalive_sent_at_ms ~= nil, "outstanding probe recorded")
+
+    client:clear_runtime_state({ clear_pending_commands = false })
+    assert_eq(client.keepalive_sent_at_ms, nil, "probe cleared on teardown")
+
+    client.state = "CONNECTED"
+    assert_eq(client:send_keepalive(), false, "no keepalive before the session is ready")
+  end)
+
   Driver.Companion.client = old_client
-  Driver.C4Driver.now_ms = old_now
-  Driver.Companion.watchdog_interval_ms = old_interval
-  Driver.Companion.watchdog_stale_ms = old_stale
+  if not ok then error(err, 2) end
 end
 
 function tests.airplay_monitor_watchdog_sends_heartbeat()

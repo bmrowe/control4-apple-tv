@@ -5,8 +5,8 @@
     <name>Apple TV</name>
     <model>Apple TV</model>
     <created>05/02/2026 12:00 AM</created>
-    <modified>07/17/2026 12:00 AM</modified>
-    <version>68</version>
+    <modified>07/25/2026 12:00 AM</modified>
+    <version>72</version>
     <small image_source="c4z">icons/device_sm.png</small>
     <large image_source="c4z">icons/device_lg.png</large>
     <control>lua_gen</control>
@@ -506,12 +506,26 @@
         <documentation file="www/documentation.rtf" />
         <script file="driver.lua" />
         <properties>
+            <!--
+              Composer renders these in declaration order and DriverWorks has no
+              section-header construct, so order is the only grouping available.
+            -->
+
+            <!-- Setup -->
             <property>
                 <name>Apple TV Address</name>
                 <default />
                 <type>STRING</type>
                 <readonly>false</readonly>
             </property>
+            <property>
+                <name>Pairing PIN</name>
+                <default />
+                <type>STRING</type>
+                <readonly>false</readonly>
+            </property>
+
+            <!-- Status (read-only) -->
             <property>
                 <name>Connection State</name>
                 <default>Disconnected</default>
@@ -530,17 +544,41 @@
                 <type>STRING</type>
                 <readonly>true</readonly>
             </property>
+
+            <!-- Everyday use -->
             <property>
                 <name>Launch App</name>
                 <type>DYNAMIC_LIST</type>
                 <readonly>false</readonly>
             </property>
+
+            <!-- Actions when the device is selected / deselected -->
             <property>
-                <name>Pairing PIN</name>
-                <default />
-                <type>STRING</type>
+                <name>Send Menu Tap on ON</name>
+                <type>LIST</type>
+                <items>
+                    <item>False</item>
+                    <item>True</item>
+                </items>
+                <default>False</default>
                 <readonly>false</readonly>
+                <tooltip>Send a Menu tap when the room selects this device. Wakes a sleeping Apple TV and dismisses the screensaver so the room lands on a usable screen.</tooltip>
             </property>
+            <property>
+                <name>On Power Off</name>
+                <type>LIST</type>
+                <items>
+                    <item>Do Nothing</item>
+                    <item>Home</item>
+                    <item>Back</item>
+                    <item>Menu</item>
+                </items>
+                <default>Do Nothing</default>
+                <readonly>false</readonly>
+                <tooltip>Button to send when the room deselects this device, to leave the Apple TV on a known screen.</tooltip>
+            </property>
+
+            <!-- Mini App handoff -->
             <property>
                 <name>After Mini App Launch</name>
                 <type>LIST</type>
@@ -558,6 +596,8 @@
                 <readonly>false</readonly>
                 <tooltip>Native Control4 Apple TV driver to select after a MiniApp launch.</tooltip>
             </property>
+
+            <!-- Remote button mapping -->
             <property>
                 <name>MENU Button</name>
                 <type>LIST</type>
@@ -686,18 +726,7 @@
                 <default>Do Nothing</default>
                 <readonly>false</readonly>
             </property>
-            <property>
-                <name>On Power Off</name>
-                <type>LIST</type>
-                <items>
-                    <item>Do Nothing</item>
-                    <item>Home</item>
-                    <item>Back</item>
-                    <item>Menu</item>
-                </items>
-                <default>Do Nothing</default>
-                <readonly>false</readonly>
-            </property>
+            <!-- Diagnostics -->
             <property>
                 <name>Debug Mode</name>
                 <type>LIST</type>
