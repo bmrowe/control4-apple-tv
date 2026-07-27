@@ -3478,6 +3478,34 @@ function Companion.looks_like_launch_identifier(value)
   return value:find(".", 1, true) ~= nil
 end
 
+-- Scores how well an app-list entry matches the requested name; nil means no
+-- match. Substring containment alone is too blunt: asking for "MLB TV" when the
+-- store entry is now just "MLB" also drags in the Apple "TV" app, and treating
+-- both as equal candidates makes every launch ambiguous. Ranking keeps the
+-- entry that actually carries the request ahead of incidental word matches.
+function Companion.fuzzy_match_score(needle, candidate)
+  if needle == "" or candidate == "" then return nil end
+  if candidate == needle then return 400 end
+
+  local at = candidate:find(needle, 1, true)
+  if at then
+    -- Requested name sits inside a longer entry ("Max" in "HBO Max"); the
+    -- entry closest in length is the most likely intent.
+    return 300 - math.min(#candidate - #needle, 99) + (at == 1 and 1 or 0)
+  end
+
+  at = needle:find(candidate, 1, true)
+  if at then
+    -- Entry is shorter than the request ("MLB" for "MLB TV"). Ignore stubs and
+    -- trailing filler words that carry no identity of their own.
+    if #candidate < 3 then return nil end
+    if at ~= 1 and #candidate * 2 < #needle then return nil end
+    return 200 + math.min(#candidate, 99)
+  end
+
+  return nil
+end
+
 function Companion.find_app_by_name(name)
   local normalized = Companion.normalize_app_name(name)
   if normalized == "" then return nil end
@@ -3493,22 +3521,31 @@ function Companion.find_app_by_name(name)
   end
   if exact_match then return exact_match end
 
-  local fuzzy_match
-  if #normalized >= 4 then
-    for _, app in ipairs(Companion.app_list_rows or {}) do
-      local app_name = Companion.normalize_app_name(app.name)
+  if #normalized < 4 then return nil end
+
+  local best_match, best_score, tied
+  for _, app in ipairs(Companion.app_list_rows or {}) do
+    local score = Companion.fuzzy_match_score(normalized, Companion.normalize_app_name(app.name))
+    if not score then
       local app_id = Companion.normalize_app_name(app.identifier)
-      if (app_name ~= "" and (app_name:find(normalized, 1, true) or normalized:find(app_name, 1, true))) or
-         (app_id ~= "" and app_id:find(normalized, 1, true))
-      then
-        if fuzzy_match and fuzzy_match ~= app.identifier then
-          return nil, "multiple apps fuzzily match " .. tostring(name)
-        end
-        fuzzy_match = app.identifier
+      if app_id ~= "" and app_id:find(normalized, 1, true) then
+        -- Bundle ids match below every name match.
+        score = 100
+      end
+    end
+    if score then
+      if not best_score or score > best_score then
+        best_match, best_score, tied = app.identifier, score, false
+      elseif score == best_score and app.identifier ~= best_match then
+        tied = true
       end
     end
   end
-  return fuzzy_match
+
+  if tied then
+    return nil, "multiple apps fuzzily match " .. tostring(name)
+  end
+  return best_match
 end
 
 function Companion.render_current_app(app)
@@ -4572,18 +4609,21 @@ function C4MiniApps.alias_for(name)
     end
   end
   if #normalized >= 4 then
-    local fuzzy_match, fuzzy_alias
+    local best_match, best_alias, best_score, tied
     for alias, bundle_id in pairs(C4MiniApps.aliases or {}) do
-      local alias_norm = Companion.normalize_app_name(alias)
-      if alias_norm:find(normalized, 1, true) or normalized:find(alias_norm, 1, true) then
-        if fuzzy_match and fuzzy_match ~= bundle_id then
-          return nil, nil, "multiple aliases match " .. tostring(name)
+      local score = Companion.fuzzy_match_score(normalized, Companion.normalize_app_name(alias))
+      if score then
+        if not best_score or score > best_score then
+          best_match, best_alias, best_score, tied = bundle_id, alias, score, false
+        elseif score == best_score and bundle_id ~= best_match then
+          tied = true
         end
-        fuzzy_match = bundle_id
-        fuzzy_alias = alias
       end
     end
-    return fuzzy_match, fuzzy_alias
+    if tied then
+      return nil, nil, "multiple aliases match " .. tostring(name)
+    end
+    return best_match, best_alias
   end
   return nil
 end

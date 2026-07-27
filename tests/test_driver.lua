@@ -2796,6 +2796,78 @@ function tests.mini_app_ignores_composer_routing_chatter()
   assert_eq(#Driver.Companion.sent_messages, 0, "routing chatter does not send Companion commands")
 end
 
+function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
+  local old_app_list = Driver.Companion.app_list
+  local old_app_rows = Driver.Companion.app_list_rows
+  Driver.Companion.app_list_rows = {
+    { name = "MLB", identifier = "com.mlb.AtBat" },
+    { name = "TV", identifier = "com.apple.TVWatchList" },
+    { name = "Netflix", identifier = "com.netflix.Netflix" },
+  }
+
+  -- "MLB TV" is a superstring of both "MLB" and "TV"; the longer, leading
+  -- match is the intended app and the generic "TV" entry must not tie it.
+  local id, err = Driver.Companion.find_app_by_name("MLB TV")
+  assert_eq(err, nil, "no ambiguity reported")
+  assert_eq(id, "com.mlb.AtBat", "resolves MLB TV to the MLB app")
+
+  -- A trailing generic word alone is never enough to claim a launch.
+  assert_eq(Driver.Companion.find_app_by_name("Bravo TV"), nil, "generic TV suffix does not match")
+
+  -- Requested name inside a longer entry still resolves.
+  assert_eq(Driver.Companion.find_app_by_name("Netflx"), nil, "typos still miss")
+  Driver.Companion.app_list_rows = {
+    { name = "HBO Max", identifier = "com.wbd.stream" },
+  }
+  assert_eq(Driver.Companion.find_app_by_name("HBO Max Go"), "com.wbd.stream", "superstring request resolves")
+
+  -- Two entries the request fits equally well are still reported as ambiguous
+  -- rather than guessed at.
+  Driver.Companion.app_list_rows = {
+    { name = "Sports Center", identifier = "com.a.one" },
+    { name = "Sports Centre", identifier = "com.b.two" },
+  }
+  local ambiguous, ambiguous_err = Driver.Companion.find_app_by_name("Sports Cent")
+  assert_eq(ambiguous, nil, "ambiguous request unresolved")
+  assert(ambiguous_err and ambiguous_err:match("fuzzily match"), "ambiguity reported")
+
+  Driver.Companion.app_list = old_app_list
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
+function tests.mini_app_launch_resolves_mlb_tv_after_app_store_rename()
+  local old_app_list = Driver.Companion.app_list
+  local old_app_rows = Driver.Companion.app_list_rows
+  local old_last_launch_id = Driver.C4MiniApps.last_launch_id
+  local old_last_launch_at_ms = Driver.C4MiniApps.last_launch_at_ms
+  Driver.C4MiniApps.last_launch_id = nil
+  Driver.C4MiniApps.last_launch_at_ms = nil
+  Driver.Companion.sent_messages = {}
+  Driver.Companion.app_list = {
+    ["com.mlb.AtBat"] = "MLB",
+    ["com.apple.TVWatchList"] = "TV",
+  }
+  Driver.Companion.app_list_rows = {
+    { name = "MLB", identifier = "com.mlb.AtBat" },
+    { name = "TV", identifier = "com.apple.TVWatchList" },
+  }
+  Driver.C4MiniApps.register_binding(3101, {
+    name = "MLB TV",
+    service_id = "MLB TV",
+  })
+
+  ReceivedFromProxy(3101, "SELECT", {})
+
+  local last = Driver.Companion.sent_messages[#Driver.Companion.sent_messages]
+  assert_table_has(last, "_i", "_launchApp")
+  assert_table_has(last._c, "_bundleID", "com.mlb.AtBat")
+
+  Driver.C4MiniApps.last_launch_id = old_last_launch_id
+  Driver.C4MiniApps.last_launch_at_ms = old_last_launch_at_ms
+  Driver.Companion.app_list = old_app_list
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
 function tests.mini_app_launch_resolves_friendly_name_from_dynamic_app_list()
   local old_app_list = Driver.Companion.app_list
   local old_app_rows = Driver.Companion.app_list_rows
