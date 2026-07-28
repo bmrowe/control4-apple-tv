@@ -4882,49 +4882,72 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
   end
   local proxy_device_id = C4MiniApps.resolve_selectable_device_id(native_device_id)
   local passthrough_proxy_device_id = C4MiniApps.resolve_own_passthrough_device_id()
-  local matched_rooms = {}
+  -- Scoped by app proxy rather than room: the rooms are not known yet, and two
+  -- Mini App launches in flight at once arrive on different app proxies.
+  local timer_name = C4MiniApps.native_handoff_timer .. "_" .. tostring(app_proxy_id)
 
+  -- Rooms already showing the Mini App proxy at launch time. Usually empty:
+  -- this runs inside the SET_INPUT dispatch that announces the switch, and the
+  -- room's CURRENT_SELECTED_DEVICE variable does not catch up for ~50ms. Room
+  -- matching therefore happens again when the timer fires; this set only
+  -- carries the tolerance for a room that moves on to our own passthrough
+  -- proxy in the meantime.
+  local rooms_at_launch = {}
   for room_id, device_id in pairs(C4MiniApps.room_sources or {}) do
     if C4MiniApps.same_device_id(device_id, app_proxy_id) then
-      matched_rooms[#matched_rooms + 1] = room_id
+      rooms_at_launch[room_id] = true
     end
   end
-  if #matched_rooms == 0 then
-    Log.debug("mini app native handoff found no room selected on app proxy " .. tostring(app_proxy_id))
-    return false
-  end
 
-  for _, room_id in ipairs(matched_rooms) do
-    local function reselect()
-      C4MiniApps.active_handoff_timers[C4MiniApps.native_handoff_timer .. "_" .. tostring(room_id)] = nil
-      local current_source = (C4MiniApps.room_sources or {})[room_id]
-      local source_still_relevant = C4MiniApps.same_device_id(current_source, app_proxy_id) or
-        (passthrough_proxy_device_id and C4MiniApps.same_device_id(current_source, passthrough_proxy_device_id))
-      if not source_still_relevant then
-        Log.debug("mini app native handoff skipped: room selection changed room=" ..
-          tostring(room_id) .. " appProxy=" .. tostring(app_proxy_id) ..
-          " current=" .. tostring(current_source))
-        return
+  local function reselect()
+    C4MiniApps.active_handoff_timers[timer_name] = nil
+
+    local target_rooms = {}
+    for room_id, device_id in pairs(C4MiniApps.room_sources or {}) do
+      if C4MiniApps.same_device_id(device_id, app_proxy_id) then
+        target_rooms[#target_rooms + 1] = room_id
+      elseif rooms_at_launch[room_id] and passthrough_proxy_device_id and
+             C4MiniApps.same_device_id(device_id, passthrough_proxy_device_id)
+      then
+        target_rooms[#target_rooms + 1] = room_id
       end
-      Log.debug("mini app native handoff selecting device " .. tostring(native_device_id) ..
+    end
+    if #target_rooms == 0 then
+      Log.debug("mini app native handoff skipped: no room selected on app proxy " ..
+        tostring(app_proxy_id))
+      return false
+    end
+
+    -- The room reports the media proxy as its selected device, so select that
+    -- directly; the driver device id is kept as the fallback for installs
+    -- where the proxy lookup found nothing selectable.
+    local target_device_id = proxy_device_id or native_device_id
+    for _, room_id in ipairs(target_rooms) do
+      Log.debug("mini app native handoff selecting device " .. tostring(target_device_id) ..
         " in room " .. tostring(room_id) ..
-        " nativeProxy=" .. tostring(proxy_device_id))
+        " nativeDriver=" .. tostring(native_device_id))
       C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
-        deviceid = native_device_id,
-        DEVICE_ID = native_device_id,
+        deviceid = target_device_id,
+        DEVICE_ID = target_device_id,
       })
       C4MiniApps.verify_native_handoff(room_id, native_device_id, proxy_device_id)
     end
-
-    if has_c4() and type(SetTimer) == "function" then
-      local timer_name = C4MiniApps.native_handoff_timer .. "_" .. tostring(room_id)
-      C4MiniApps.active_handoff_timers[timer_name] = true
-      SetTimer(timer_name, C4MiniApps.native_handoff_delay_ms, reselect)
-    else
-      reselect()
-    end
+    return true
   end
-  return true
+
+  if has_c4() and type(SetTimer) == "function" then
+    -- Owning the launch is decided here, not by whether a room matches yet:
+    -- returning false would hand it to the return-to-this-driver path and the
+    -- handoff would be lost to the variable lag.
+    if C4MiniApps.active_handoff_timers[timer_name] then
+      Log.debug("mini app native handoff already pending for app proxy " .. tostring(app_proxy_id))
+      return true
+    end
+    C4MiniApps.active_handoff_timers[timer_name] = true
+    SetTimer(timer_name, C4MiniApps.native_handoff_delay_ms, reselect)
+    return true
+  end
+  return reselect()
 end
 
 function C4MiniApps.resolve_own_passthrough_device_id()
@@ -4984,18 +5007,19 @@ function C4MiniApps.verify_native_handoff(room_id, native_device_id, proxy_devic
         " nativeDriver=" .. tostring(native_device_id))
       return
     end
+    -- The media proxy was already tried; fall back to the driver device id.
     if proxy_device_id and not C4MiniApps.same_device_id(proxy_device_id, native_device_id)
         and has_c4() and C4.SendToDevice
     then
-      Log.debug("mini app native handoff falling back to proxy " .. tostring(proxy_device_id) ..
+      Log.debug("mini app native handoff falling back to driver " .. tostring(native_device_id) ..
         " in room " .. tostring(room_id) ..
-        " nativeDriver=" .. tostring(native_device_id) ..
+        " nativeProxy=" .. tostring(proxy_device_id) ..
         " current=" .. tostring(value))
       C4:SendToDevice(room_id, "SELECT_VIDEO_DEVICE", {
-        deviceid = proxy_device_id,
-        DEVICE_ID = proxy_device_id,
+        deviceid = native_device_id,
+        DEVICE_ID = native_device_id,
       })
-      C4MiniApps.verify_room_selection(room_id, proxy_device_id, "native handoff proxy fallback")
+      C4MiniApps.verify_room_selection(room_id, native_device_id, "native handoff driver fallback")
       return
     end
     Log.error("mini app native handoff did not select expected device: room=" ..
