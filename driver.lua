@@ -2827,6 +2827,10 @@ local Companion = {
   -- ON arrives several times per user action (room select plus source select).
   menu_tap_debounce_ms = 3000,
   menu_tap_last_at_ms = nil,
+  -- How long the tap is held so a launch in the same selection burst can
+  -- supersede it. See C4Driver.arm_menu_tap_on_select.
+  menu_tap_grace_ms = 250,
+  menu_tap_timer = "AppleTV_menu_tap_on_select",
   -- Deterministic launch confirmation. A launch is confirmed by an ack to the
   -- _launchApp request or by a foreground event naming the target; only an
   -- explicit failure or a confirm timeout triggers a bounded, same-session
@@ -6824,6 +6828,10 @@ end
 -- again (which is what used to clobber an app the user had switched to
 -- out-of-band via voice or the Apple TV remote).
 function C4Driver.start_launch(target)
+  -- A launch supersedes the wake tap: the tap would arrive on the Apple TV
+  -- either just before or, on a waking device, just after the app comes up,
+  -- and either way it navigates out of the app being launched.
+  C4Driver.cancel_menu_tap_on_select("app launch")
   Companion.launch.pending = {
     target = target,
     attempts = 1,
@@ -7048,8 +7056,30 @@ function C4Driver.request_menu_tap_on_select()
   end
   Companion.menu_tap_last_at_ms = now
   Companion.menu_tap_on_select_pending = true
-  C4Driver.flush_menu_tap_on_select()
+  C4Driver.arm_menu_tap_on_select()
   return true
+end
+
+-- The tap is held for a grace period so a launch arriving in the same room
+-- selection burst can cancel it. Selecting a Mini App sends ON on the AV
+-- switch binding ~9ms before the SET_INPUT that carries the launch, so an
+-- immediate tap lands on a device that is about to change apps: tvOS delivers
+-- it into the app we just asked for and backs straight out of it. _launchApp
+-- wakes the Apple TV on its own, so the tap has nothing to add there. A plain
+-- source selection with no app behind it still taps once the grace expires.
+function C4Driver.arm_menu_tap_on_select()
+  if not (has_c4() and type(SetTimer) == "function") then
+    return C4Driver.flush_menu_tap_on_select()
+  end
+  C4Driver.cancel_timer(Companion.menu_tap_timer)
+  local ok, err = pcall(SetTimer, Companion.menu_tap_timer, Companion.menu_tap_grace_ms, function()
+    C4Driver.flush_menu_tap_on_select()
+  end)
+  if not ok then
+    Log.debug("Menu tap grace timer unavailable: " .. tostring(err))
+    return C4Driver.flush_menu_tap_on_select()
+  end
+  return false
 end
 
 function C4Driver.flush_menu_tap_on_select()
@@ -7059,12 +7089,14 @@ function C4Driver.flush_menu_tap_on_select()
     return false
   end
   Companion.menu_tap_on_select_pending = false
+  C4Driver.cancel_timer(Companion.menu_tap_timer)
   Log.debug("sending Menu tap on device select")
   Companion.button_action("MENU", nil, { priority = true })
   return true
 end
 
 function C4Driver.cancel_menu_tap_on_select(reason)
+  C4Driver.cancel_timer(Companion.menu_tap_timer)
   if not Companion.menu_tap_on_select_pending then return false end
   Companion.menu_tap_on_select_pending = false
   Log.debug("pending Menu tap on select dropped: " .. tostring(reason or "deselected"))
@@ -7699,6 +7731,7 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_airplay_monitor_watchdog")
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
   C4Driver.cancel_timer(Companion.launch.timer)
+  C4Driver.cancel_timer(Companion.menu_tap_timer)
   MDNS.cancel_all()
 end
 

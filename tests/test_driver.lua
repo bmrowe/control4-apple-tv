@@ -1825,6 +1825,74 @@ function tests.menu_tap_on_select_debounces_duplicate_on()
   Properties = old_properties
 end
 
+-- Selecting a Mini App sends ON ~9ms before the SET_INPUT carrying the launch,
+-- so the tap must not have gone out by the time the launch is issued.
+function tests.menu_tap_on_select_is_superseded_by_a_launch()
+  local old_properties = Properties
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local old_cancel_timer = CancelTimer
+  Properties = { ["Send Menu Tap on ON"] = "True" }
+  local env = menu_tap_env()
+  env.client.state = "SESSION_ACTIVE"
+
+  local scheduled, cancelled = {}, {}
+  C4 = { GetDeviceID = function() return 0 end }
+  SetTimer = function(timer_name, _, callback) scheduled[timer_name] = callback end
+  CancelTimer = function(timer_name)
+    cancelled[timer_name] = true
+    scheduled[timer_name] = nil
+  end
+
+  assert_eq(Driver.C4Driver.request_menu_tap_on_select(), true, "ON requests the tap")
+  assert_eq(#env.hid_commands(), 0, "tap is held, not sent on the ON")
+  assert_eq(scheduled[Driver.Companion.menu_tap_timer] ~= nil, true, "grace timer armed")
+
+  Driver.C4Driver.start_launch("com.att.tv")
+  assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "launch drops the pending tap")
+  assert_eq(cancelled[Driver.Companion.menu_tap_timer], true, "launch cancels the grace timer")
+  assert_eq(#env.hid_commands(), 0, "no MENU ever reaches the Apple TV")
+
+  Driver.C4Driver.reset_launch("test cleanup")
+  C4 = old_c4
+  SetTimer = old_set_timer
+  CancelTimer = old_cancel_timer
+  env.restore()
+  Properties = old_properties
+end
+
+-- A room selection with no app behind it still gets its wake tap.
+function tests.menu_tap_on_select_fires_when_no_launch_follows()
+  local old_properties = Properties
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local old_cancel_timer = CancelTimer
+  Properties = { ["Send Menu Tap on ON"] = "True" }
+  local env = menu_tap_env()
+  env.client.state = "SESSION_ACTIVE"
+
+  local scheduled = {}
+  C4 = { GetDeviceID = function() return 0 end }
+  SetTimer = function(timer_name, _, callback) scheduled[timer_name] = callback end
+  CancelTimer = function(timer_name) scheduled[timer_name] = nil end
+
+  Driver.C4Driver.request_menu_tap_on_select()
+  local grace = scheduled[Driver.Companion.menu_tap_timer]
+  assert_eq(grace ~= nil, true, "grace timer armed")
+
+  grace()
+  local hids = env.hid_commands()
+  assert_eq(#hids, 2, "tap delivered once the grace expires")
+  assert_eq(hids[1], 5, "the tap is the MENU HID command")
+  assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "pending intent consumed")
+
+  C4 = old_c4
+  SetTimer = old_set_timer
+  CancelTimer = old_cancel_timer
+  env.restore()
+  Properties = old_properties
+end
+
 function tests.queued_command_does_not_reenter_connect_while_connecting()
   local client = Driver.CompanionClient.new({
     credentials = Driver.Credentials.parse(table.concat({
