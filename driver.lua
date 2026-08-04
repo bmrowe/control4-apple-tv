@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.53-dev",
+  VERSION = "0.1.54-dev",
 }
 
 local function has_c4()
@@ -3504,9 +3504,14 @@ function Companion.fuzzy_match_score(needle, candidate)
   at = needle:find(candidate, 1, true)
   if at then
     -- Entry is shorter than the request ("MLB" for "MLB TV"). Ignore stubs and
-    -- trailing filler words that carry no identity of their own.
+    -- filler words that carry no identity of their own.
     if #candidate < 3 then return nil end
-    if at ~= 1 and #candidate * 2 < #needle then return nil end
+    -- An entry that starts or ends the request is the distinctive part of it
+    -- ("MLB" in "MLB TV", "ESPN" in "WatchESPN") and carries the identity on
+    -- its own. Only an entry buried in the middle has to earn it by covering
+    -- half the request. "TV" in "Bravo TV" is already out on the length floor.
+    local anchored = at == 1 or needle:sub(-#candidate) == candidate
+    if not anchored and #candidate * 2 < #needle then return nil end
     return 200 + math.min(#candidate, 99)
   end
 

@@ -2937,6 +2937,29 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
   -- A trailing generic word alone is never enough to claim a launch.
   assert_eq(Driver.Companion.find_app_by_name("Bravo TV"), nil, "generic TV suffix does not match")
 
+  -- An entry that ends the request is as distinctive as one that starts it:
+  -- "ESPN" is the identity in "WatchESPN", and covering only 4 of 9 characters
+  -- used to disqualify it.
+  Driver.Companion.app_list_rows = {
+    { name = "ESPN", identifier = "com.espn.ScoreCenter" },
+    { name = "Netflix", identifier = "com.netflix.Netflix" },
+  }
+  assert_eq(Driver.Companion.find_app_by_name("WatchESPN"), "com.espn.ScoreCenter",
+    "trailing brand resolves WatchESPN")
+
+  -- Buried in the middle it still has to earn the match.
+  Driver.Companion.app_list_rows = {
+    { name = "ESPN", identifier = "com.espn.ScoreCenter" },
+  }
+  assert_eq(Driver.Companion.find_app_by_name("Watch ESPN Deportes Live"), nil,
+    "an entry buried mid-request still must cover half of it")
+
+  Driver.Companion.app_list_rows = {
+    { name = "MLB", identifier = "com.mlb.AtBat" },
+    { name = "TV", identifier = "com.apple.TVWatchList" },
+    { name = "Netflix", identifier = "com.netflix.Netflix" },
+  }
+
   -- Requested name inside a longer entry still resolves.
   assert_eq(Driver.Companion.find_app_by_name("Netflx"), nil, "typos still miss")
   Driver.Companion.app_list_rows = {
