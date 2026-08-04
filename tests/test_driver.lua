@@ -1,8 +1,6 @@
 dofile("tests/compat_bit32.lua")
 local Driver = dofile("driver.lua")
 
--- Opt in to sent-message recording; the driver keeps it off in production
--- because only the tests below read it.
 Driver.Companion.record_history = true
 
 local function assert_eq(actual, expected, label)
@@ -1853,7 +1851,6 @@ function tests.menu_tap_on_select_is_superseded_by_a_launch()
   assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "launch drops the pending tap")
   assert_eq(cancelled[Driver.Companion.menu_tap_timer], true, "launch cancels the grace timer")
 
-    -- The launch's own WAKE is fine; MENU is what must never arrive.
   for _, hid in ipairs(env.hid_commands()) do
     assert_eq(hid ~= 5, true, "no MENU ever reaches the Apple TV")
   end
@@ -1866,7 +1863,6 @@ function tests.menu_tap_on_select_is_superseded_by_a_launch()
   Properties = old_properties
 end
 
--- A room selection with no app behind it still gets its wake tap.
 function tests.menu_tap_on_select_fires_when_no_launch_follows()
   local old_properties = Properties
   local old_c4 = C4
@@ -2735,7 +2731,6 @@ function tests.launch_confirms_on_ack_and_never_retries()
     assert(#env.armed >= 1, "confirm timer armed")
     local writes_before = #writes
 
-    -- The Apple TV acks the launch.
     client.pending_responses[xid].on_response({})
     assert_eq(Driver.Companion.launch.pending, nil, "ack clears the pending launch")
 
@@ -2753,12 +2748,10 @@ function tests.launch_deferred_until_the_session_is_ready()
     local now = 50000
     Driver.C4Driver.now_ms = function() return now end
 
-    -- No client at all: the session is not ready, so nothing goes on the wire.
     Driver.C4Driver.start_launch("com.mlb.AtBatUniversal")
     assert_eq(Driver.Companion.launch.deferred ~= nil, true, "launch intent held")
     assert_eq(Driver.Companion.launch.deferred.target, "com.mlb.AtBatUniversal", "target held")
 
-    -- The teardown that follows a refused connect clears the pending launch.
     Driver.C4Driver.reset_launch("session teardown")
     assert_eq(Driver.Companion.launch.pending, nil, "pending launch cleared by teardown")
     assert_eq(Driver.Companion.launch.deferred ~= nil, true, "deferred intent survives teardown")
@@ -2784,8 +2777,7 @@ function tests.launch_deferred_until_the_session_is_ready()
   end)
 end
 
--- Short-lived on purpose: replaying after an arbitrary reconnect is what
--- no_queue exists to prevent.
+-- Short-lived on purpose: a later replay is what no_queue exists to prevent.
 function tests.deferred_launch_expires_and_is_dropped_on_room_off()
   run_launch_test(function()
     local old_now = Driver.C4Driver.now_ms
@@ -2807,7 +2799,6 @@ function tests.deferred_launch_expires_and_is_dropped_on_room_off()
         "a stale intent never reaches the wire")
     end
 
-    -- A room that turns off drops the intent outright.
     Driver.Companion.client = nil
     Driver.C4Driver.start_launch("com.mlb.AtBatUniversal")
     assert_eq(Driver.Companion.launch.deferred ~= nil, true, "intent held again")
@@ -2871,11 +2862,9 @@ function tests.launch_confirms_on_foreground_event()
     Driver.C4Driver.start_launch("com.netflix.Netflix")
     assert(Driver.Companion.launch.pending ~= nil, "pending before any device report")
 
-    -- The optimistic current_app set at launch time must not self-confirm.
     Driver.C4Driver.note_current_app_observed(nil)
     assert(Driver.Companion.launch.pending ~= nil, "optimistic value does not confirm")
 
-    -- A genuine device report naming the target confirms it.
     Driver.C4Driver.handle_companion_message({ _i = "CurrentApp", _c = { app_id = "com.netflix.Netflix" } })
     assert_eq(Driver.Companion.launch.pending, nil, "foreground event confirms the launch")
   end)
@@ -2884,8 +2873,7 @@ end
 function tests.launch_superseded_by_external_app_change()
   run_launch_test(function(env)
     Driver.C4Driver.start_launch("com.netflix.Netflix")
-    -- User jumps to a different app out-of-band (e.g. voice / Apple TV remote):
-    -- a real foreground report for an app we did not launch supersedes ours.
+    -- Out-of-band jump (voice / remote) supersedes our pending launch.
     Driver.C4Driver.handle_companion_message({ _i = "CurrentApp", _c = { app_id = "com.google.ios.youtube" } })
     assert_eq(Driver.Companion.launch.pending, nil, "external app change abandons the pending launch")
 
@@ -2935,7 +2923,6 @@ function tests.launch_is_not_resurrected_across_reconnect()
     Driver.C4Driver.start_launch("com.netflix.Netflix")
     assert_eq(env.launch_count(), 1, "one launch sent under the current session")
 
-    -- A reconnect bumps the session generation.
     Driver.Companion.session_generation = Driver.Companion.session_generation + 1
 
     -- The confirm timer from the previous session fires late; it must not relaunch.
@@ -3028,17 +3015,12 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
     { name = "Netflix", identifier = "com.netflix.Netflix" },
   }
 
-  -- "MLB TV" is a superstring of both "MLB" and "TV"; the longer, leading
-  -- match is the intended app and the generic "TV" entry must not tie it.
   local id, err = Driver.Companion.find_app_by_name("MLB TV")
   assert_eq(err, nil, "no ambiguity reported")
   assert_eq(id, "com.mlb.AtBat", "resolves MLB TV to the MLB app")
 
-  -- A trailing generic word alone is never enough to claim a launch.
   assert_eq(Driver.Companion.find_app_by_name("Bravo TV"), nil, "generic TV suffix does not match")
 
-  -- "ESPN" is the identity in "WatchESPN"; covering 4 of 9 characters used to
-  -- disqualify it.
   Driver.Companion.app_list_rows = {
     { name = "ESPN", identifier = "com.espn.ScoreCenter" },
     { name = "Netflix", identifier = "com.netflix.Netflix" },
@@ -3046,7 +3028,6 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
   assert_eq(Driver.Companion.find_app_by_name("WatchESPN"), "com.espn.ScoreCenter",
     "trailing brand resolves WatchESPN")
 
-  -- Buried in the middle it still has to earn the match.
   Driver.Companion.app_list_rows = {
     { name = "ESPN", identifier = "com.espn.ScoreCenter" },
   }
@@ -3059,15 +3040,12 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
     { name = "Netflix", identifier = "com.netflix.Netflix" },
   }
 
-  -- Requested name inside a longer entry still resolves.
   assert_eq(Driver.Companion.find_app_by_name("Netflx"), nil, "typos still miss")
   Driver.Companion.app_list_rows = {
     { name = "HBO Max", identifier = "com.wbd.stream" },
   }
   assert_eq(Driver.Companion.find_app_by_name("HBO Max Go"), "com.wbd.stream", "superstring request resolves")
 
-  -- Two entries the request fits equally well are still reported as ambiguous
-  -- rather than guessed at.
   Driver.Companion.app_list_rows = {
     { name = "Sports Center", identifier = "com.a.one" },
     { name = "Sports Centre", identifier = "com.b.two" },
@@ -3098,8 +3076,6 @@ function tests.mini_app_resolves_from_another_platform_bundle_id()
   })
   assert_eq(resolved, "com.espn.ScoreCenter", "Shield bundle id resolves the Apple TV app")
 
-  -- With no bundle id to go on, another platform's label still beats a fuzzy
-  -- match on the stale APP_NAME.
   local by_name = Driver.C4MiniApps.resolve_launch_id({
     name = "Some Retired Name",
     service_ids = { "34376", "ESPN" },
@@ -3109,7 +3085,6 @@ function tests.mini_app_resolves_from_another_platform_bundle_id()
   Driver.Companion.app_list_rows = old_app_rows
 end
 
--- "Apple TV" is a name, not an id behind a launch verb, and must survive.
 function tests.mini_app_service_ids_split_into_bundles_and_names()
   local bundles, names = Driver.C4MiniApps.split_service_ids({
     "551012",
@@ -3378,16 +3353,12 @@ function tests.native_handoff_sends_nothing_when_no_room_matches_at_fire_time()
     scheduled[timer_name] = callback
   end
 
-  -- Scheduling is claimed up front, but if no room is on the app proxy when the
-  -- timer fires, nothing is selected and no fallback is attempted.
   local selected = Driver.C4MiniApps.select_native_apple_tv_after_launch(9102)
   assert_eq(selected, true, "native handoff claims the launch while rooms settle")
 
   scheduled["AppleTV_native_driver_handoff_9102"]()
   assert_eq(#selections, 0, "native handoff sends no selection without matched room")
 
-  -- With no timer available there is nothing to defer to, so the caller is told
-  -- the handoff did not happen and the return-to-this-driver path takes over.
   SetTimer = nil
   Driver.C4MiniApps.active_handoff_timers = {}
   assert_eq(Driver.C4MiniApps.select_native_apple_tv_after_launch(9102), false,
@@ -3430,8 +3401,7 @@ function tests.native_handoff_uses_app_proxy_scoped_timer()
 
   local selected = Driver.C4MiniApps.select_native_apple_tv_after_launch(9102)
 
-  -- One timer per app proxy, not per room: rooms are matched when it fires, so
-  -- they are not known yet. Both rooms on this proxy are served by this timer.
+  -- One timer per app proxy: rooms are not known until it fires.
   assert_eq(selected, true, "native handoff scheduled")
   assert_eq(#timers, 1, "single handoff timer armed")
   assert_contains(timers, "AppleTV_native_driver_handoff_9102", "app proxy handoff timer")
@@ -3501,8 +3471,7 @@ function tests.native_handoff_allows_passthrough_intermediate_selection()
 end
 
 -- CURRENT_SELECTED_DEVICE lags the SET_INPUT by ~50ms, so no room matches when
--- the handoff is scheduled. Undeferred, that lost the handoff entirely unless
--- Control4 happened to send the selection burst twice.
+-- the handoff is scheduled.
 function tests.native_handoff_survives_room_variable_lag()
   local old_c4 = C4
   local old_properties = Properties
@@ -3556,7 +3525,6 @@ function tests.native_handoff_survives_room_variable_lag()
   assert_eq(scheduled["AppleTV_reselect_passthrough"], nil, "passthrough reselect not armed")
   assert(scheduled["AppleTV_native_driver_handoff_9102"], "native handoff armed despite no room match")
 
-  -- The room variable catches up, then the timer fires.
   Driver.C4MiniApps.room_sources[260] = 9102
   scheduled["AppleTV_native_driver_handoff_9102"]()
 

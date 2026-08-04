@@ -17,7 +17,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.57-dev",
+  VERSION = "0.1.58-dev",
 }
 
 local function has_c4()
@@ -26,9 +26,8 @@ end
 
 local Log = {}
 
--- Lua evaluates a call's arguments before the call, so Log.debug's early-out
--- cannot save the cost of building its message. Use this to guard call sites
--- that run per frame/message or that format payloads (Bytes.hex, PB.describe).
+-- Arguments are evaluated before the call, so Log.debug's early-out cannot save
+-- building the message. Guard per-frame call sites and payload formatting.
 function Log.is_debug()
   if not has_c4() then
     return true
@@ -67,9 +66,8 @@ function Log.output(message)
   end
 end
 
--- A refused connection is the normal state for a sleeping Apple TV, so it is
--- reported once per episode rather than once per attempt. `owner` holds the
--- counter and must outlive the per-session state, which is cleared on error.
+-- Refusal is normal for a sleeping Apple TV, so report once per episode. The
+-- counter lives on `owner`, which outlives the per-session state.
 local Refused = {}
 Refused.ECONNREFUSED = "111"
 
@@ -378,9 +376,8 @@ function MDNS.close()
   MDNS.started_at_ms = nil
 end
 
--- Abort the in-flight discovery and discard anything queued behind it without
--- answering their callers. Teardown only (driver destroy / explicit disconnect),
--- where nobody is left to care about the answer.
+-- Teardown only: queued callers are dropped unanswered, which is safe because
+-- nobody is left to care about the answer.
 function MDNS.cancel_all()
   MDNS.queue = {}
   MDNS.close()
@@ -719,9 +716,7 @@ function OPACK.array(elements)
 end
 
 function OPACK.int64(high32, low32)
-  -- Stores a 64-bit integer as two 32-bit halves to avoid Lua double precision loss
-  -- (2^53 mantissa bits can't represent arbitrary 64-bit values).
-  -- Used for the combined Companion session SID from remote/local sid halves.
+  -- Two 32-bit halves: Lua's 53-bit mantissa cannot hold a 64-bit session SID.
   assert(type(high32) == "number" and high32 >= 0 and high32 <= 0xFFFFFFFF, "int64 high32 out of range")
   assert(type(low32) == "number" and low32 >= 0 and low32 <= 0xFFFFFFFF, "int64 low32 out of range")
   return { __opack_type = "int64", high32 = high32, low32 = low32 }
@@ -1999,8 +1994,6 @@ local function openssl_assert(value, err, label)
 end
 
 function OpenSSLCrypto.generate_x25519_keypair()
-  -- Native bn X25519 is fast enough to generate synchronously on demand; the
-  -- former prewarm cache existed only for the slow pure-Lua path and is gone.
   local scalar = OpenSSLCrypto.random_bytes(32)
   return {
     private_key = scalar,
@@ -2024,8 +2017,6 @@ function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
   return Ed25519Pure.sign_expanded(expanded, data)
 end
 
--- Ed25519 now runs entirely on native bn (no precomputed fixed-base tables and
--- no persisted crypto cache). Expanded signing keys are memoized in-process only.
 function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
   assert(type(private_key_bytes) == "string" and #private_key_bytes == 32, "Ed25519 private key must be 32 bytes")
   local key = Bytes.hex(private_key_bytes)
@@ -2779,9 +2770,8 @@ local Companion = {
   state = "DISCONNECTED",
   port = 49153,
   tx = 0,
-  -- Sent-message history is a test observability seam: nothing in the driver
-  -- reads it. Recording is off by default so the controller does not hold 100
-  -- request objects resident for no production purpose; the test harness opts in.
+  -- Test observability seam; off by default so the controller holds no
+  -- request objects resident for it.
   record_history = false,
   sent_messages = {},
   sent_messages_max = 100,
@@ -2814,14 +2804,11 @@ local Companion = {
   menu_tap_grace_ms = 250,
   menu_tap_timer = "AppleTV_menu_tap_on_select",
   tv_system_status_logged = nil,
-  -- See C4Driver.start_launch.
   launch = {
     timer = "AppleTV_launch_confirm",
     confirm_timeout_ms = 5000,
     max_attempts = 2,
     pending = nil,
-    -- Re-issued when the session comes up. Bounded so it cannot become the
-    -- stale replay no_queue exists to prevent.
     deferred = nil,
     defer_window_ms = 15000,
   },
@@ -2854,16 +2841,14 @@ local AirPlay = {
   monitor_enabled = false,
   monitor_state = "Stopped",
   monitor_retry_ms = 15000,
-  -- Retries back off exponentially up to this ceiling. A powered-off Apple TV is
-  -- the normal overnight state; retrying a discovery + TCP connect + HAP
-  -- pair-verify every 15s forever is a lot of controller work for nothing.
+  -- A powered-off Apple TV is the normal overnight state, and a discovery +
+  -- connect + pair-verify every 15s forever is a lot of work for nothing.
   monitor_retry_max_ms = 300000,
   monitor_retry_attempts = 0,
   monitor_stall_logged = false,
   refused_attempts = 0,
-  -- Covers the whole "starting -> tunnel up" window (discovery + TCP + HAP
-  -- pair-verify). Nothing else guards that stretch, so a start that never calls
-  -- back used to strand the monitor in DISCOVERING forever.
+  -- Nothing else guards discovery + TCP + pair-verify, so a start that never
+  -- called back used to strand the monitor in DISCOVERING forever.
   monitor_start_timeout_ms = 30000,
   monitor_heartbeat_ms = 30000,
   monitor_stale_ms = 90000,
@@ -3378,9 +3363,8 @@ end
 function Companion.launch_app(bundle_id_or_url, options)
   assert(type(bundle_id_or_url) == "string" and bundle_id_or_url ~= "", "bundle id or URL required")
   local key = string.match(bundle_id_or_url, "^[%a][%w+.-]*:") and "_urlS" or "_bundleID"
-  -- "Current App" is not set optimistically here: it is published only once the
-  -- launch is confirmed (see C4Driver.confirm_launch), so an abandoned launch
-  -- never leaves the property claiming an app that never came up.
+  -- Published only once the launch is confirmed, so an abandoned launch never
+  -- leaves the property claiming an app that never came up.
   return Companion.send_opack("_launchApp", { [key] = bundle_id_or_url }, 2, options)
 end
 
@@ -3466,24 +3450,21 @@ function Companion.looks_like_launch_identifier(value)
   return value:find(".", 1, true) ~= nil
 end
 
--- Scores an app-list entry against the requested name; nil means no match.
--- Plain containment is too blunt -- "MLB TV" drags in the Apple "TV" app and
--- every launch turns ambiguous -- so candidates are ranked, not just collected.
+-- Plain containment is too blunt: "MLB TV" drags in the Apple "TV" app and
+-- every launch turns ambiguous, so candidates are ranked rather than collected.
 function Companion.fuzzy_match_score(needle, candidate)
   if needle == "" or candidate == "" then return nil end
   if candidate == needle then return 400 end
 
   local at = candidate:find(needle, 1, true)
   if at then
-    -- Requested name sits inside a longer entry ("Max" in "HBO Max"); the
-    -- entry closest in length is the most likely intent.
+    -- "Max" in "HBO Max": the entry closest in length is the likeliest intent.
     return 300 - math.min(#candidate - #needle, 99) + (at == 1 and 1 or 0)
   end
 
   at = needle:find(candidate, 1, true)
   if at then
-    -- Entry is shorter than the request ("MLB" for "MLB TV"). Ignore stubs and
-    -- filler words that carry no identity of their own.
+    -- "MLB" for "MLB TV". Stubs and filler words carry no identity.
     if #candidate < 3 then return nil end
     -- An entry that starts or ends the request carries its identity ("MLB" in
     -- "MLB TV", "ESPN" in "WatchESPN"); one buried mid-request has to earn it.
@@ -3495,7 +3476,6 @@ function Companion.fuzzy_match_score(needle, candidate)
   return nil
 end
 
--- Split out so several candidate names can all try exact before any try fuzzy.
 function Companion.find_app_by_exact_name(name)
   local normalized = Companion.normalize_app_name(name)
   if normalized == "" then return nil end
@@ -3512,8 +3492,8 @@ function Companion.find_app_by_exact_name(name)
   return exact_match
 end
 
--- Normalized like names, which is what lets another platform's id stand in:
--- com.espn.score_center and com.espn.ScoreCenter normalize to the same string.
+-- com.espn.score_center and com.espn.ScoreCenter normalize alike, which is how
+-- another platform's id can stand in for the Apple TV one.
 function Companion.find_app_by_bundle_id(bundle_id)
   local normalized = Companion.normalize_app_name(bundle_id)
   if normalized == "" then return nil end
@@ -3544,7 +3524,6 @@ function Companion.find_app_by_name(name)
     if not score then
       local app_id = Companion.normalize_app_name(app.identifier)
       if app_id ~= "" and app_id:find(normalized, 1, true) then
-        -- Bundle ids match below every name match.
         score = 100
       end
     end
@@ -3630,9 +3609,7 @@ function Companion.update_from_message(message)
       name = app_name or Companion.app_name_for_bundle(app_id) or app_id,
     }
     changed.current_app = true
-    -- A genuine device report of the foreground app (not the value we set
-    -- optimistically at launch time). Only this is trustworthy for confirming a
-    -- pending launch.
+    -- A device report, not the value we set optimistically at launch time.
     changed.observed_app = app_id or app_name
   end
 
@@ -4102,7 +4079,6 @@ end
 
 function CompanionClient:on_ready_for_commands()
   self:flush_pending_commands()
-  -- Before the tap: a launch cancels it, and it would land on the opening app.
   if C4Driver and C4Driver.flush_deferred_launch then
     C4Driver.flush_deferred_launch()
   end
@@ -4674,8 +4650,6 @@ function C4MiniApps.resolve_launch_id(service)
     Log.debug("mini app service id appears to be app name: " .. tostring(service_id))
   end
 
-  -- Best evidence first: another platform's bundle id, then any exact name,
-  -- then fuzzy on the possibly-stale APP_NAME.
   local bundle_candidates, name_candidates = C4MiniApps.split_service_ids(service.service_ids)
 
   for _, candidate in ipairs(bundle_candidates) do
@@ -4981,9 +4955,8 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
       return false
     end
 
-    -- The room reports the media proxy as its selected device, so select that
-    -- directly; the driver device id is kept as the fallback for installs
-    -- where the proxy lookup found nothing selectable.
+    -- The room reports the media proxy as its selected device; the driver id is
+    -- the fallback for installs where the proxy lookup found nothing.
     local target_device_id = proxy_device_id or native_device_id
     for _, room_id in ipairs(target_rooms) do
       Log.debug("mini app native handoff selecting device " .. tostring(target_device_id) ..
@@ -4999,9 +4972,8 @@ function C4MiniApps.select_native_apple_tv_after_launch(app_proxy_id)
   end
 
   if has_c4() and type(SetTimer) == "function" then
-    -- Owning the launch is decided here, not by whether a room matches yet:
-    -- returning false would hand it to the return-to-this-driver path and the
-    -- handoff would be lost to the variable lag.
+    -- Returning false here would hand the launch to the return-to-this-driver
+    -- path and lose the handoff to the variable lag.
     if C4MiniApps.active_handoff_timers[timer_name] then
       Log.debug("mini app native handoff already pending for app proxy " .. tostring(app_proxy_id))
       return true
@@ -5070,7 +5042,6 @@ function C4MiniApps.verify_native_handoff(room_id, native_device_id, proxy_devic
         " nativeDriver=" .. tostring(native_device_id))
       return
     end
-    -- The media proxy was already tried; fall back to the driver device id.
     if proxy_device_id and not C4MiniApps.same_device_id(proxy_device_id, native_device_id)
         and has_c4() and C4.SendToDevice
     then
@@ -5151,8 +5122,6 @@ function C4MiniApps.launch_service(service, app_proxy_id, options)
       return nil
     end
     Log.debug("launch mini app " .. launch_id)
-    -- Confirmation and any retry are owned by C4Driver.start_launch; the mini
-    -- app path just issues the launch.
     local request, frame = C4Driver.launch_app(launch_id)
     C4MiniApps.after_launch_selection(app_proxy_id)
     return request, frame
@@ -5249,16 +5218,23 @@ function C4MiniApps.collect_service_ids(device_id)
   return values
 end
 
--- A launch-verb prefix ("APP_LAUNCH com.apple.appletv") is stripped only when
--- it is all-caps and id-shaped, so a name like "Apple TV" is left alone.
+local function strip_launch_verb_prefix(value)
+  local without_verb = value:match("^[%u_]+%s+(%S+)$")
+  if without_verb and without_verb:find(".", 1, true) then
+    return without_verb
+  end
+  return value
+end
+
+local function looks_like_bundle_id(value)
+  return value:find(".", 1, true) ~= nil and not value:find(" ", 1, true)
+end
+
 function C4MiniApps.split_service_ids(service_ids)
   local bundles, names = {}, {}
-  for _, value in ipairs(service_ids or {}) do
-    local stripped = value:match("^[%u_]+%s+(%S+)$")
-    if stripped and stripped:find(".", 1, true) then
-      value = stripped
-    end
-    if value:find(".", 1, true) and not value:find(" ", 1, true) then
+  for _, service_id in ipairs(service_ids or {}) do
+    local value = strip_launch_verb_prefix(service_id)
+    if looks_like_bundle_id(value) then
       bundles[#bundles + 1] = value
     else
       names[#names + 1] = value
@@ -5434,7 +5410,6 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
     return nil
   end
 
-  -- Power: ON scopes the metadata monitor to active room use.
   if command == "ON" then
     if not Companion.client or Companion.client.state == "DISCONNECTED" then
       C4Driver.connect_companion()
@@ -6924,9 +6899,8 @@ function C4Driver.launch_app(bundle_id_or_url)
   return C4Driver.start_launch(bundle_id_or_url)
 end
 
--- Sent once, then confirmed by an ack or a foreground event. Only a rejection
--- or a confirm timeout retries, scoped to the issuing session generation, so a
--- confirmed launch never fires again over an app the user switched to.
+-- Scoped to the issuing session generation so a confirmed launch never fires
+-- again over an app the user switched to out-of-band.
 function C4Driver.start_launch(target)
   C4Driver.cancel_menu_tap_on_select("app launch")
   C4Driver.drop_deferred_launch("newer launch")
@@ -6948,9 +6922,8 @@ function C4Driver.companion_ready_for_commands()
   return (client and client.is_ready_for_commands and client:is_ready_for_commands()) and true or false
 end
 
--- Waking the Apple TV is what makes the session available, so a launch that
--- causes the reconnect has nothing to send on. no_queue rightly refuses to park
--- it; holding the intent briefly is the difference from doing nothing at all.
+-- Waking the Apple TV is what makes its session available, so the launch that
+-- causes the reconnect has nothing to send on until that reconnect lands.
 function C4Driver.defer_launch(target)
   Companion.launch.deferred = { target = target, at_ms = C4Driver.now_ms() }
   Log.debug("launch deferred until the Companion session is ready: target=" .. tostring(target))
@@ -6982,9 +6955,8 @@ function C4Driver.flush_deferred_launch()
   return true
 end
 
--- A sleeping Apple TV acks _launchApp without bringing the app up, so wake
--- first. WAKE is not a navigation event, so unlike MENU it cannot back out of
--- the app being launched and needs no state check.
+-- A sleeping Apple TV acks _launchApp without bringing the app up. WAKE is not
+-- a navigation event, so unlike MENU it cannot back out of the opening app.
 function C4Driver.wake_before_launch()
   if not C4Driver.companion_ready_for_commands() then
     return false
@@ -6994,8 +6966,6 @@ function C4Driver.wake_before_launch()
   return true
 end
 
--- Send the _launchApp frame with ack handlers. no_queue keeps it point-in-time:
--- if the session is not ready it is not parked for a later flush.
 function C4Driver.send_launch(target)
   if not C4Driver.companion_ready_for_commands() then
     C4Driver.defer_launch(target)
@@ -7047,8 +7017,6 @@ function C4Driver.on_launch_error(target, err_message)
   C4Driver.retry_launch("error")
 end
 
--- Confirmation from either signal (ack or foreground event). First one wins;
--- once confirmed the launch is done and can never retry.
 function C4Driver.confirm_launch(target, reason)
   local pending = Companion.launch.pending
   if not pending or pending.confirmed or pending.target ~= target then return end
@@ -7086,8 +7054,6 @@ function C4Driver.reset_launch(reason)
   C4Driver.cancel_timer(Companion.launch.timer)
 end
 
--- Callers pass the observed identifier, never the optimistic value set at send
--- time, so a launch is only ever confirmed by real evidence.
 function C4Driver.note_current_app_observed(observed_identifier)
   local pending = Companion.launch.pending
   if not pending or pending.confirmed then return end
@@ -7112,8 +7078,6 @@ function C4Driver.refresh_app_list()
 end
 
 
--- Delay for the next retry: monitor_retry_ms doubled per consecutive failure,
--- capped at monitor_retry_max_ms. Reset by monitor_retry_succeeded().
 function C4Driver.airplay_monitor_retry_delay_ms()
   local attempts = AirPlay.monitor_retry_attempts or 0
   local delay = AirPlay.monitor_retry_ms
@@ -7139,9 +7103,8 @@ function C4Driver.airplay_monitor_retry_succeeded()
   C4Driver.airplay_monitor_connected()
 end
 
--- Guards the window between "start requested" and "tunnel up". Every other path
--- out of a start attempt is driven by a callback; if one never arrives, this is
--- the only thing that gets the monitor moving again.
+-- Every other path out of a start attempt is callback-driven; if none arrives,
+-- this is the only thing that gets the monitor moving again.
 function C4Driver.schedule_airplay_monitor_start_watchdog()
   if not (has_c4() and type(SetTimer) == "function") then return end
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
@@ -7193,8 +7156,7 @@ function C4Driver.menu_tap_on_select_enabled()
   return tostring(configured or "False") == "True"
 end
 
--- Wakes a sleeping Apple TV and clears the screensaver. Off by default: on an
--- awake Apple TV the tap is a real navigation event.
+-- Off by default: on an awake Apple TV the tap is a real navigation event.
 function C4Driver.request_menu_tap_on_select()
   if not C4Driver.menu_tap_on_select_enabled() then return false end
   local now = C4Driver.now_ms()
@@ -8035,18 +7997,14 @@ function GetCommandParamList(commandName, paramName)
   then
     local rows = Companion.app_list_rows
     if not rows or #rows == 0 then
-      -- No apps fetched yet: hint toward Refresh App List rather than showing an
-      -- empty dropdown. The entry has no bundle id/URL, so firing it errors cleanly
-      -- (and "Launch App By ID" remains the free-type escape hatch either way).
+      -- Hint rather than an empty dropdown. It carries no bundle id, so firing
+      -- it errors cleanly.
       return { "", "(no apps - run Refresh App List first)" }
     end
     return Companion.app_selector_items(rows)
   end
 end
 
--- ExecuteCommand, OnPropertyChanged, OnSystemEvent, OnWatchedVariableChanged,
--- and ReceivedFromProxy are all defined by DCP handlers.lua and dispatch via the
--- EC, OPC, OSE, OWVC, and RFP tables registered above.
 
 Driver.Log = Log
 Driver.Refused = Refused
