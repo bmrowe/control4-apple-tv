@@ -75,9 +75,8 @@ local function xor_bytes(a, b)
   return table.concat(out)
 end
 
--- Captured before any test stubs anything. When lua-openssl is installed the
--- canned-digest tables below are only a fallback: unknown inputs hash for real,
--- so adding a step to a crypto self-test cannot silently break the stub.
+  -- Captured before any stubbing. With lua-openssl present the canned digests
+  -- are only a fallback, so a new self-test step cannot silently break the stub.
 local REAL_SHA512
 do
   local ok, openssl = pcall(require, "openssl")
@@ -934,10 +933,8 @@ function tests.openssl_crypto_self_test_uses_documented_call_shapes()
     end)
   end)
 
-  -- Only calls routed through OpenSSLCrypto.load_openssl() are observable here.
-  -- The SRP/curve bignums deliberately require openssl directly (_ensure_curve),
-  -- so the fake never sees bn.powmod; self_test asserting A = g^3 mod N == 125 is
-  -- what covers the real powmod path.
+  -- Only calls routed through load_openssl() are observable; the SRP/curve
+  -- bignums require openssl directly, so self_test covers the real powmod.
   assert_contains(fake.calls, "rand.bytes:32", "secure random call")
 end
 
@@ -1708,8 +1705,7 @@ local function menu_tap_env()
   Driver.Companion.client = client
   Driver.Companion.menu_tap_on_select_pending = false
   Driver.Companion.menu_tap_last_at_ms = nil
-  -- on_ready_for_commands also flushes a deferred launch, which would put a
-  -- wake on the wire and be mistaken for a tap.
+  -- A flushed deferred launch would put a wake on the wire, read as a tap.
   local saved_deferred = Driver.Companion.launch.deferred
   Driver.Companion.launch.deferred = nil
 
@@ -1857,8 +1853,7 @@ function tests.menu_tap_on_select_is_superseded_by_a_launch()
   assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "launch drops the pending tap")
   assert_eq(cancelled[Driver.Companion.menu_tap_timer], true, "launch cancels the grace timer")
 
-  -- The launch sends its own WAKE, which is not a navigation event; what must
-  -- never reach the Apple TV is MENU.
+    -- The launch's own WAKE is fine; MENU is what must never arrive.
   for _, hid in ipairs(env.hid_commands()) do
     assert_eq(hid ~= 5, true, "no MENU ever reaches the Apple TV")
   end
@@ -2648,9 +2643,7 @@ local function launch_test_client(writes)
   return client
 end
 
--- Shared harness for the confirmation-driven launch tests. Installs fake timers
--- (captured in env.armed, fired via env.fire_last), a clean launch state, and
--- restores every global it touched afterward.
+-- Fake timers in env.armed, fired via env.fire_last; restores what it touches.
 local function run_launch_test(fn)
   local saved = {
     C4 = C4,
@@ -2662,8 +2655,7 @@ local function run_launch_test(fn)
     sent = Driver.Companion.sent_messages,
     current_app = Driver.Companion.current_app,
     app_list = Driver.Companion.app_list,
-    -- Several of these tests stub the clock; restore it here so a failing
-    -- assert cannot leak it into the rest of the suite.
+    -- Restored here so a failing assert cannot leak a stubbed clock.
     now_ms = Driver.C4Driver.now_ms,
     deferred = Driver.Companion.launch.deferred,
   }
@@ -2734,8 +2726,7 @@ function tests.launch_confirms_on_ack_and_never_retries()
 
     Driver.C4Driver.start_launch("com.netflix.Netflix")
     assert(Driver.Companion.launch.pending ~= nil, "launch is pending until confirmed")
-    -- The wake registers pending responses of its own, so pick the launch's
-    -- rather than whichever one next() happens to return.
+    -- The wake registers its own, so pick the launch's, not next()'s.
     local xid
     for id, pending in pairs(client.pending_responses) do
       if pending.identifier == "_launchApp" then xid = id end
@@ -2754,9 +2745,8 @@ function tests.launch_confirms_on_ack_and_never_retries()
   end)
 end
 
--- Selecting a source on a sleeping Apple TV arrives before the session exists:
--- the connect is refused, discovery re-runs, and the session lands a few
--- hundred milliseconds later. The launch must survive that gap.
+-- On a sleeping Apple TV the connect is refused and the session lands a few
+-- hundred milliseconds later; the launch must survive that gap.
 function tests.launch_deferred_until_the_session_is_ready()
   run_launch_test(function()
     local old_now = Driver.C4Driver.now_ms
@@ -2794,8 +2784,8 @@ function tests.launch_deferred_until_the_session_is_ready()
   end)
 end
 
--- The intent is deliberately short-lived: replaying a launch after an
--- arbitrary reconnect is exactly what no_queue exists to prevent.
+-- Short-lived on purpose: replaying after an arbitrary reconnect is what
+-- no_queue exists to prevent.
 function tests.deferred_launch_expires_and_is_dropped_on_room_off()
   run_launch_test(function()
     local old_now = Driver.C4Driver.now_ms
@@ -2828,8 +2818,7 @@ function tests.deferred_launch_expires_and_is_dropped_on_room_off()
   end)
 end
 
--- A sleeping or screensaving Apple TV acks _launchApp without bringing the app
--- up, so the wake has to be on the wire ahead of the launch.
+-- A sleeping Apple TV acks _launchApp without bringing the app up.
 function tests.launch_wakes_the_apple_tv_before_sending_the_launch()
   run_launch_test(function()
     local client = Driver.CompanionClient.new({
@@ -2866,8 +2855,7 @@ function tests.launch_wakes_the_apple_tv_before_sending_the_launch()
   end)
 end
 
--- The wake is as point-in-time as the launch: replaying it after a reconnect
--- would wake a device the user has since left alone.
+-- As point-in-time as the launch: a later replay wakes a device left alone.
 function tests.launch_wake_is_not_queued_when_session_not_ready()
   run_launch_test(function()
     Driver.C4Driver.start_launch("com.netflix.Netflix")
@@ -3049,9 +3037,8 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
   -- A trailing generic word alone is never enough to claim a launch.
   assert_eq(Driver.Companion.find_app_by_name("Bravo TV"), nil, "generic TV suffix does not match")
 
-  -- An entry that ends the request is as distinctive as one that starts it:
-  -- "ESPN" is the identity in "WatchESPN", and covering only 4 of 9 characters
-  -- used to disqualify it.
+  -- "ESPN" is the identity in "WatchESPN"; covering 4 of 9 characters used to
+  -- disqualify it.
   Driver.Companion.app_list_rows = {
     { name = "ESPN", identifier = "com.espn.ScoreCenter" },
     { name = "Netflix", identifier = "com.netflix.Netflix" },
@@ -3093,10 +3080,8 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
   Driver.Companion.app_list_rows = old_app_rows
 end
 
--- Real payload from Control4's stock ESPN Mini App driver. It has no
--- UM_APPLETV key -- none of them do -- and its APP_NAME is the retired
--- "WatchESPN", but UM_NV_SHIELD carries Android's com.espn.score_center, which
--- normalizes to the installed com.espn.ScoreCenter.
+-- Real payload from the stock ESPN Mini App: no UM_APPLETV key, a retired
+-- "WatchESPN" APP_NAME, and an Android id that normalizes to the Apple one.
 function tests.mini_app_resolves_from_another_platform_bundle_id()
   local old_app_rows = Driver.Companion.app_list_rows
   Driver.Companion.app_list_rows = {
@@ -3124,8 +3109,7 @@ function tests.mini_app_resolves_from_another_platform_bundle_id()
   Driver.Companion.app_list_rows = old_app_rows
 end
 
--- "APP_LAUNCH com.apple.appletv" is an id behind a launch verb; "Apple TV" is
--- an ordinary two-word name and must not be shortened to "TV".
+-- "Apple TV" is a name, not an id behind a launch verb, and must survive.
 function tests.mini_app_service_ids_split_into_bundles_and_names()
   local bundles, names = Driver.C4MiniApps.split_service_ids({
     "551012",
@@ -3394,9 +3378,8 @@ function tests.native_handoff_sends_nothing_when_no_room_matches_at_fire_time()
     scheduled[timer_name] = callback
   end
 
-  -- Scheduling is claimed up front (the room variable may still be catching
-  -- up), but if no room is on the app proxy once the timer fires, nothing is
-  -- selected and no fallback is attempted.
+  -- Scheduling is claimed up front, but if no room is on the app proxy when the
+  -- timer fires, nothing is selected and no fallback is attempted.
   local selected = Driver.C4MiniApps.select_native_apple_tv_after_launch(9102)
   assert_eq(selected, true, "native handoff claims the launch while rooms settle")
 
@@ -3517,11 +3500,9 @@ function tests.native_handoff_allows_passthrough_intermediate_selection()
   Driver.C4MiniApps.active_handoff_timers = old_timers
 end
 
--- The room's CURRENT_SELECTED_DEVICE variable lags the SET_INPUT that triggers
--- the launch by ~50ms on hardware, so no room matches the app proxy when the
--- handoff is scheduled. Before this was deferred, that handed the launch to the
--- return-to-this-driver path and the native handoff was lost unless Control4
--- happened to send the selection burst twice.
+-- CURRENT_SELECTED_DEVICE lags the SET_INPUT by ~50ms, so no room matches when
+-- the handoff is scheduled. Undeferred, that lost the handoff entirely unless
+-- Control4 happened to send the selection burst twice.
 function tests.native_handoff_survives_room_variable_lag()
   local old_c4 = C4
   local old_properties = Properties
@@ -5121,9 +5102,8 @@ for name in pairs(tests) do
 end
 table.sort(names)
 
--- Tests run under pcall so one failure reports instead of aborting the run and
--- hiding every test after it. Restore the globals a test body may swap in but
--- not put back if it fails partway, so a single failure does not cascade.
+  -- Under pcall so one failure reports instead of hiding every test after it;
+  -- restore globals a failing body may not have put back, so it cannot cascade.
 local passed, skipped = 0, 0
 local failures = {}
 
