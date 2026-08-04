@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.55-dev",
+  VERSION = "0.1.56-dev",
 }
 
 local function has_c4()
@@ -2843,6 +2843,12 @@ local Companion = {
     confirm_timeout_ms = 5000,
     max_attempts = 2,
     pending = nil,
+    -- A launch issued while the Apple TV was still refusing connections is
+    -- held here and re-issued once the session comes up. Short-lived on
+    -- purpose: this must never become the stale replay that no_queue exists to
+    -- prevent. See C4Driver.defer_launch.
+    deferred = nil,
+    defer_window_ms = 15000,
   },
 }
 
@@ -4130,6 +4136,11 @@ end
 
 function CompanionClient:on_ready_for_commands()
   self:flush_pending_commands()
+  -- Before the Menu tap: a deferred launch cancels the tap, and on a device
+  -- that just woke the tap would land on the app the launch is opening.
+  if C4Driver and C4Driver.flush_deferred_launch then
+    C4Driver.flush_deferred_launch()
+  end
   if C4Driver and C4Driver.flush_menu_tap_on_select then
     C4Driver.flush_menu_tap_on_select()
   end
@@ -5485,6 +5496,7 @@ function C4MiniApps.handle_proxy_command(binding_id, command, params)
   end
   if command == "OFF" then
     C4Driver.cancel_menu_tap_on_select("room off")
+    C4Driver.drop_deferred_launch("room off")
     local mapped_hid, mapped_action, handled_mapping = C4MiniApps.mapped_button_action(command, params._resolved_action)
     if handled_mapping and mapped_hid then
       if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
@@ -6975,6 +6987,8 @@ function C4Driver.start_launch(target)
   -- either just before or, on a waking device, just after the app comes up,
   -- and either way it navigates out of the app being launched.
   C4Driver.cancel_menu_tap_on_select("app launch")
+  -- A newer launch supersedes an intent still waiting on the session.
+  C4Driver.drop_deferred_launch("newer launch")
   Companion.launch.pending = {
     target = target,
     attempts = 1,
@@ -6994,9 +7008,52 @@ end
 -- being launched -- so it is safe on every launch and needs no state check.
 -- Sent inline rather than queued: like the launch itself, a wake that cannot go
 -- out now is of no use later.
-function C4Driver.wake_before_launch()
+function C4Driver.companion_ready_for_commands()
   local client = Companion.client
-  if not (client and client.is_ready_for_commands and client:is_ready_for_commands()) then
+  return (client and client.is_ready_for_commands and client:is_ready_for_commands()) and true or false
+end
+
+-- A selection that wakes a sleeping Apple TV arrives before the Companion
+-- session exists: the TCP connect is refused, discovery re-runs, and the
+-- session only lands a few hundred milliseconds later. The launch itself is
+-- correctly not queued -- replaying it after an arbitrary reconnect is what
+-- no_queue prevents -- but dropping it outright means the selection does
+-- nothing at all, which is what "turned it on and nothing happened" was. The
+-- intent is held instead, and re-issued when the session comes up if it is
+-- still fresh.
+function C4Driver.defer_launch(target)
+  Companion.launch.deferred = { target = target, at_ms = C4Driver.now_ms() }
+  Log.debug("launch deferred until the Companion session is ready: target=" .. tostring(target))
+end
+
+function C4Driver.drop_deferred_launch(reason)
+  if not Companion.launch.deferred then return false end
+  Log.debug("deferred launch dropped (" .. tostring(reason or "superseded") .. "): target=" ..
+    tostring(Companion.launch.deferred.target))
+  Companion.launch.deferred = nil
+  return true
+end
+
+function C4Driver.flush_deferred_launch()
+  local deferred = Companion.launch.deferred
+  if not deferred then return false end
+  Companion.launch.deferred = nil
+
+  local age = C4Driver.now_ms() - (deferred.at_ms or 0)
+  if age < 0 or age > Companion.launch.defer_window_ms then
+    Log.debug("deferred launch dropped as stale: target=" .. tostring(deferred.target) ..
+      " age=" .. tostring(age) .. "ms")
+    return false
+  end
+
+  Log.debug("re-issuing deferred launch now that the session is ready: target=" ..
+    tostring(deferred.target))
+  C4Driver.start_launch(deferred.target)
+  return true
+end
+
+function C4Driver.wake_before_launch()
+  if not C4Driver.companion_ready_for_commands() then
     return false
   end
   Log.debug("sending WAKE before launch")
@@ -7010,6 +7067,9 @@ function C4Driver.send_launch(target)
   -- Every attempt wakes first, retries included: an attempt that timed out
   -- most likely found the Apple TV asleep, which is exactly when re-waking
   -- matters.
+  if not C4Driver.companion_ready_for_commands() then
+    C4Driver.defer_launch(target)
+  end
   C4Driver.wake_before_launch()
   return Companion.launch_app(target, {
     no_queue = true,

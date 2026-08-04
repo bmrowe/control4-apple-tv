@@ -1708,6 +1708,10 @@ local function menu_tap_env()
   Driver.Companion.client = client
   Driver.Companion.menu_tap_on_select_pending = false
   Driver.Companion.menu_tap_last_at_ms = nil
+  -- on_ready_for_commands also flushes a deferred launch, which would put a
+  -- wake on the wire and be mistaken for a tap.
+  local saved_deferred = Driver.Companion.launch.deferred
+  Driver.Companion.launch.deferred = nil
 
   local env = { client = client, writes = writes }
 
@@ -1727,6 +1731,7 @@ local function menu_tap_env()
     Driver.Companion.client = nil
     Driver.Companion.menu_tap_on_select_pending = false
     Driver.Companion.menu_tap_last_at_ms = nil
+    Driver.Companion.launch.deferred = saved_deferred
   end
 
   return env
@@ -2622,6 +2627,27 @@ function tests.mini_app_launch_debounces_duplicate_switcher_burst()
   Driver.Companion.app_list_rows = old_app_rows
 end
 
+-- Minimal SESSION_ACTIVE Companion client for the launch tests.
+local function launch_test_client(writes)
+  writes = writes or {}
+  local client = Driver.CompanionClient.new({
+    credentials = Driver.Credentials.parse(table.concat({
+      Driver.Bytes.hex(string.rep("\x01", 32)),
+      Driver.Bytes.hex(string.rep("\x02", 32)),
+      Driver.Bytes.hex("ATV-ID"),
+      Driver.Bytes.hex("CLIENT-ID"),
+    }, ":")),
+    crypto = {
+      encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+      decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+    },
+    transport = { Write = function(_, data) writes[#writes + 1] = data end },
+  })
+  client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+  client.state = "SESSION_ACTIVE"
+  return client
+end
+
 -- Shared harness for the confirmation-driven launch tests. Installs fake timers
 -- (captured in env.armed, fired via env.fire_last), a clean launch state, and
 -- restores every global it touched afterward.
@@ -2636,6 +2662,10 @@ local function run_launch_test(fn)
     sent = Driver.Companion.sent_messages,
     current_app = Driver.Companion.current_app,
     app_list = Driver.Companion.app_list,
+    -- Several of these tests stub the clock; restore it here so a failing
+    -- assert cannot leak it into the rest of the suite.
+    now_ms = Driver.C4Driver.now_ms,
+    deferred = Driver.Companion.launch.deferred,
   }
   local env = { armed = {}, cancelled = {} }
   C4 = { GetTime = function() return 1000 end }
@@ -2660,6 +2690,7 @@ local function run_launch_test(fn)
   end
   Driver.Companion.client = nil
   Driver.Companion.launch.pending = nil
+  Driver.Companion.launch.deferred = nil
   Driver.Companion.session_generation = 1
   Driver.Companion.sent_messages = {}
   Driver.Companion.current_app = nil
@@ -2676,6 +2707,8 @@ local function run_launch_test(fn)
   Driver.Companion.sent_messages = saved.sent
   Driver.Companion.current_app = saved.current_app
   Driver.Companion.app_list = saved.app_list
+  Driver.C4Driver.now_ms = saved.now_ms
+  Driver.Companion.launch.deferred = saved.deferred
   if not ok then error(err, 0) end
 end
 
@@ -2701,7 +2734,12 @@ function tests.launch_confirms_on_ack_and_never_retries()
 
     Driver.C4Driver.start_launch("com.netflix.Netflix")
     assert(Driver.Companion.launch.pending ~= nil, "launch is pending until confirmed")
-    local xid = next(client.pending_responses)
+    -- The wake registers pending responses of its own, so pick the launch's
+    -- rather than whichever one next() happens to return.
+    local xid
+    for id, pending in pairs(client.pending_responses) do
+      if pending.identifier == "_launchApp" then xid = id end
+    end
     assert(xid ~= nil, "launch registered a pending ack handler")
     assert(#env.armed >= 1, "confirm timer armed")
     local writes_before = #writes
@@ -2713,6 +2751,80 @@ function tests.launch_confirms_on_ack_and_never_retries()
     -- A stale confirm timer firing afterward must not re-launch.
     env.fire_last()
     assert_eq(#writes, writes_before, "no resend after a confirmed launch")
+  end)
+end
+
+-- Selecting a source on a sleeping Apple TV arrives before the session exists:
+-- the connect is refused, discovery re-runs, and the session lands a few
+-- hundred milliseconds later. The launch must survive that gap.
+function tests.launch_deferred_until_the_session_is_ready()
+  run_launch_test(function()
+    local old_now = Driver.C4Driver.now_ms
+    local now = 50000
+    Driver.C4Driver.now_ms = function() return now end
+
+    -- No client at all: the session is not ready, so nothing goes on the wire.
+    Driver.C4Driver.start_launch("com.mlb.AtBatUniversal")
+    assert_eq(Driver.Companion.launch.deferred ~= nil, true, "launch intent held")
+    assert_eq(Driver.Companion.launch.deferred.target, "com.mlb.AtBatUniversal", "target held")
+
+    -- The teardown that follows a refused connect clears the pending launch.
+    Driver.C4Driver.reset_launch("session teardown")
+    assert_eq(Driver.Companion.launch.pending, nil, "pending launch cleared by teardown")
+    assert_eq(Driver.Companion.launch.deferred ~= nil, true, "deferred intent survives teardown")
+
+    local client = launch_test_client()
+    Driver.Companion.client = client
+    now = now + 800
+    client:on_ready_for_commands()
+
+    assert_eq(Driver.Companion.launch.deferred, nil, "intent consumed")
+    assert_eq(Driver.Companion.launch.pending ~= nil, true, "launch re-issued once ready")
+    assert_eq(Driver.Companion.launch.pending.target, "com.mlb.AtBatUniversal", "same target")
+
+    local launched = false
+    for _, message in ipairs(Driver.Companion.sent_messages) do
+      if message._i == "_launchApp" and message._c and message._c._bundleID == "com.mlb.AtBatUniversal" then
+        launched = true
+      end
+    end
+    assert_eq(launched, true, "the launch reached the wire after the session came up")
+
+    Driver.C4Driver.now_ms = old_now
+  end)
+end
+
+-- The intent is deliberately short-lived: replaying a launch after an
+-- arbitrary reconnect is exactly what no_queue exists to prevent.
+function tests.deferred_launch_expires_and_is_dropped_on_room_off()
+  run_launch_test(function()
+    local old_now = Driver.C4Driver.now_ms
+    local now = 50000
+    Driver.C4Driver.now_ms = function() return now end
+
+    Driver.C4Driver.start_launch("com.mlb.AtBatUniversal")
+    assert_eq(Driver.Companion.launch.deferred ~= nil, true, "intent held")
+
+    now = now + Driver.Companion.launch.defer_window_ms + 1
+    local before = #Driver.Companion.sent_messages
+    local client = launch_test_client()
+    Driver.Companion.client = client
+    client:on_ready_for_commands()
+    assert_eq(Driver.Companion.launch.deferred, nil, "stale intent discarded")
+
+    for i = before + 1, #Driver.Companion.sent_messages do
+      assert_eq(Driver.Companion.sent_messages[i]._i ~= "_launchApp", true,
+        "a stale intent never reaches the wire")
+    end
+
+    -- A room that turns off drops the intent outright.
+    Driver.Companion.client = nil
+    Driver.C4Driver.start_launch("com.mlb.AtBatUniversal")
+    assert_eq(Driver.Companion.launch.deferred ~= nil, true, "intent held again")
+    assert_eq(Driver.C4Driver.drop_deferred_launch("room off"), true, "room off drops it")
+    assert_eq(Driver.Companion.launch.deferred, nil, "nothing left to replay")
+
+    Driver.C4Driver.now_ms = old_now
   end)
 end
 
