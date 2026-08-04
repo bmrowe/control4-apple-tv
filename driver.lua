@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.52-dev",
+  VERSION = "0.1.53-dev",
 }
 
 local function has_c4()
@@ -2831,6 +2831,9 @@ local Companion = {
   -- supersede it. See C4Driver.arm_menu_tap_on_select.
   menu_tap_grace_ms = 250,
   menu_tap_timer = "AppleTV_menu_tap_on_select",
+  -- Last TVSystemStatus payload logged, so an unchanged state broadcast is not
+  -- reported again. See Companion.update_from_message.
+  tv_system_status_logged = nil,
   -- Deterministic launch confirmation. A launch is confirmed by an ack to the
   -- _launchApp request or by a foreground event naming the target; only an
   -- explicit failure or a confirm timeout triggers a bounded, same-session
@@ -3583,6 +3586,18 @@ function Companion.update_from_message(message)
 
   local changed = {}
   local content = type(message._c) == "table" and message._c or {}
+
+  -- The Apple TV reports its own power/display state here, which is exactly
+  -- what the launch path needs to know and currently has to guess at. The
+  -- payload shape is not documented, so log it until it can be parsed --
+  -- deduplicated because it repeats unchanged on every state broadcast.
+  if message._i == "TVSystemStatus" and Log.is_debug() then
+    local described = BPlist.describe(content)
+    if described ~= Companion.tv_system_status_logged then
+      Companion.tv_system_status_logged = described
+      Log.debug("Companion TVSystemStatus: " .. described)
+    end
+  end
 
   if message._i == "FetchLaunchableApplicationsEvent" and message._t == 3 then
     local apps, rows = Companion.parse_app_list(content)
@@ -6845,9 +6860,29 @@ function C4Driver.start_launch(target)
   return request, frame
 end
 
+-- A sleeping or screensaving Apple TV acks _launchApp without ever bringing the
+-- app up, so the wake goes first. HID WAKE is not a navigation event -- unlike
+-- the Menu tap this driver used to send on ON, it cannot back out of the app
+-- being launched -- so it is safe on every launch and needs no state check.
+-- Sent inline rather than queued: like the launch itself, a wake that cannot go
+-- out now is of no use later.
+function C4Driver.wake_before_launch()
+  local client = Companion.client
+  if not (client and client.is_ready_for_commands and client:is_ready_for_commands()) then
+    return false
+  end
+  Log.debug("sending WAKE before launch")
+  Companion.button_action("WAKE", nil, { priority = true, no_queue = true })
+  return true
+end
+
 -- Send the _launchApp frame with ack handlers. no_queue keeps it point-in-time:
 -- if the session is not ready it is not parked for a later flush.
 function C4Driver.send_launch(target)
+  -- Every attempt wakes first, retries included: an attempt that timed out
+  -- most likely found the Apple TV asleep, which is exactly when re-waking
+  -- matters.
+  C4Driver.wake_before_launch()
   return Companion.launch_app(target, {
     no_queue = true,
     on_response = function()

@@ -1851,7 +1851,12 @@ function tests.menu_tap_on_select_is_superseded_by_a_launch()
   Driver.C4Driver.start_launch("com.att.tv")
   assert_eq(Driver.Companion.menu_tap_on_select_pending, false, "launch drops the pending tap")
   assert_eq(cancelled[Driver.Companion.menu_tap_timer], true, "launch cancels the grace timer")
-  assert_eq(#env.hid_commands(), 0, "no MENU ever reaches the Apple TV")
+
+  -- The launch sends its own WAKE, which is not a navigation event; what must
+  -- never reach the Apple TV is MENU.
+  for _, hid in ipairs(env.hid_commands()) do
+    assert_eq(hid ~= 5, true, "no MENU ever reaches the Apple TV")
+  end
 
   Driver.C4Driver.reset_launch("test cleanup")
   C4 = old_c4
@@ -2708,6 +2713,56 @@ function tests.launch_confirms_on_ack_and_never_retries()
     -- A stale confirm timer firing afterward must not re-launch.
     env.fire_last()
     assert_eq(#writes, writes_before, "no resend after a confirmed launch")
+  end)
+end
+
+-- A sleeping or screensaving Apple TV acks _launchApp without bringing the app
+-- up, so the wake has to be on the wire ahead of the launch.
+function tests.launch_wakes_the_apple_tv_before_sending_the_launch()
+  run_launch_test(function()
+    local client = Driver.CompanionClient.new({
+      credentials = Driver.Credentials.parse(table.concat({
+        Driver.Bytes.hex(string.rep("\x01", 32)),
+        Driver.Bytes.hex(string.rep("\x02", 32)),
+        Driver.Bytes.hex("ATV-ID"),
+        Driver.Bytes.hex("CLIENT-ID"),
+      }, ":")),
+      crypto = {
+        encrypt = function(_, plaintext) return plaintext .. string.rep("\0", 16) end,
+        decrypt = function(_, ciphertext) return ciphertext:sub(1, #ciphertext - 16) end,
+      },
+      transport = { Write = function() end },
+    })
+    client.session = Driver.CompanionSession.new("out", "in", client.crypto)
+    client.state = "SESSION_ACTIVE"
+    Driver.Companion.client = client
+
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+
+    local order = {}
+    for _, message in ipairs(Driver.Companion.sent_messages) do
+      if message._i == "_hidC" then
+        order[#order + 1] = "hid" .. tostring(message._c and message._c._hidC)
+      elseif message._i == "_launchApp" then
+        order[#order + 1] = "launch"
+      end
+    end
+    assert_eq(order[1], "hid13", "WAKE press goes out first")
+    assert_eq(order[2], "hid13", "WAKE release follows it")
+    assert_eq(order[3], "launch", "the launch follows the wake")
+    assert_eq(order[4], nil, "nothing else is sent")
+  end)
+end
+
+-- The wake is as point-in-time as the launch: replaying it after a reconnect
+-- would wake a device the user has since left alone.
+function tests.launch_wake_is_not_queued_when_session_not_ready()
+  run_launch_test(function()
+    Driver.C4Driver.start_launch("com.netflix.Netflix")
+
+    for _, message in ipairs(Driver.Companion.sent_messages) do
+      assert_eq(message._i ~= "_hidC", true, "no wake recorded without a ready session")
+    end
   end)
 end
 
