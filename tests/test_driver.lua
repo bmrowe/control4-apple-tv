@@ -2981,6 +2981,53 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
   Driver.Companion.app_list_rows = old_app_rows
 end
 
+-- Real payload from Control4's stock ESPN Mini App driver. It has no
+-- UM_APPLETV key -- none of them do -- and its APP_NAME is the retired
+-- "WatchESPN", but UM_NV_SHIELD carries Android's com.espn.score_center, which
+-- normalizes to the installed com.espn.ScoreCenter.
+function tests.mini_app_resolves_from_another_platform_bundle_id()
+  local old_app_rows = Driver.Companion.app_list_rows
+  Driver.Companion.app_list_rows = {
+    { name = "ESPN", identifier = "com.espn.ScoreCenter" },
+    { name = "Netflix", identifier = "com.netflix.Netflix" },
+  }
+
+  local resolved = Driver.C4MiniApps.resolve_launch_id({
+    name = "WatchESPN",
+    service_ids = {
+      "34376", "com.espn.gtv", "ESPN", "com.espn.score_center",
+      "APP_LAUNCH com.espn.espnplus-prod",
+    },
+  })
+  assert_eq(resolved, "com.espn.ScoreCenter", "Shield bundle id resolves the Apple TV app")
+
+  -- With no bundle id to go on, another platform's label still beats a fuzzy
+  -- match on the stale APP_NAME.
+  local by_name = Driver.C4MiniApps.resolve_launch_id({
+    name = "Some Retired Name",
+    service_ids = { "34376", "ESPN" },
+  })
+  assert_eq(by_name, "com.espn.ScoreCenter", "platform name resolves exactly")
+
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
+-- "APP_LAUNCH com.apple.appletv" is an id behind a launch verb; "Apple TV" is
+-- an ordinary two-word name and must not be shortened to "TV".
+function tests.mini_app_service_ids_split_into_bundles_and_names()
+  local bundles, names = Driver.C4MiniApps.split_service_ids({
+    "551012",
+    "com.apple.atve.amazon.appletv",
+    "APP_LAUNCH com.apple.appletv",
+    "Apple TV",
+    "com.apple.appletv",
+  })
+  assert_eq(#bundles, 3, "three id-shaped values")
+  assert_eq(bundles[2], "com.apple.appletv", "launch verb stripped from the id")
+  assert_eq(#names, 2, "the numeric id and the plain name stay names")
+  assert_eq(names[2], "Apple TV", "two-word name left intact")
+end
+
 function tests.mini_app_launch_resolves_mlb_tv_after_app_store_rename()
   local old_app_list = Driver.Companion.app_list
   local old_app_rows = Driver.Companion.app_list_rows

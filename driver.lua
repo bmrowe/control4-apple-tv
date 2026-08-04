@@ -20,7 +20,7 @@ require('drivers-common-public.global.timer')
 require('drivers-common-public.global.handlers')
 
 local Driver = {
-  VERSION = "0.1.54-dev",
+  VERSION = "0.1.55-dev",
 }
 
 local function has_c4()
@@ -3518,7 +3518,9 @@ function Companion.fuzzy_match_score(needle, candidate)
   return nil
 end
 
-function Companion.find_app_by_name(name)
+-- Exact tier on its own, so a caller holding several candidate names can try
+-- every exact match before letting any of them reach the fuzzy pass.
+function Companion.find_app_by_exact_name(name)
   local normalized = Companion.normalize_app_name(name)
   if normalized == "" then return nil end
 
@@ -3531,8 +3533,35 @@ function Companion.find_app_by_name(name)
       exact_match = app.identifier
     end
   end
-  if exact_match then return exact_match end
+  return exact_match
+end
 
+-- Bundle ids are compared on the same normalization as names, which is what
+-- lets another platform's id stand in for the Apple TV one: Android's
+-- com.espn.score_center and Apple's com.espn.ScoreCenter are the same string
+-- once case and punctuation are gone.
+function Companion.find_app_by_bundle_id(bundle_id)
+  local normalized = Companion.normalize_app_name(bundle_id)
+  if normalized == "" then return nil end
+
+  local match
+  for _, app in ipairs(Companion.app_list_rows or {}) do
+    if Companion.normalize_app_name(app.identifier) == normalized then
+      if match and match ~= app.identifier then
+        return nil, "multiple apps match bundle id " .. tostring(bundle_id)
+      end
+      match = app.identifier
+    end
+  end
+  return match
+end
+
+function Companion.find_app_by_name(name)
+  local exact_match, exact_err = Companion.find_app_by_exact_name(name)
+  if exact_match then return exact_match end
+  if exact_err then return nil, exact_err end
+
+  local normalized = Companion.normalize_app_name(name)
   if #normalized < 4 then return nil end
 
   local best_match, best_score, tied
@@ -4671,11 +4700,51 @@ function C4MiniApps.resolve_launch_id(service)
     Log.debug("mini app service id appears to be app name: " .. tostring(service_id))
   end
 
+  -- Everything the Mini App knows about itself, best evidence first: another
+  -- platform's bundle id is exact, an exact name match on any platform's label
+  -- beats a fuzzy match on the possibly-stale APP_NAME, and fuzzy is last.
+  local bundle_candidates, name_candidates = C4MiniApps.split_service_ids(service.service_ids)
+
+  for _, candidate in ipairs(bundle_candidates) do
+    local bundle_id = Companion.find_app_by_bundle_id(candidate)
+    if bundle_id then
+      Log.debug("mini app resolved from platform bundle id: " .. tostring(candidate) ..
+        " -> " .. tostring(bundle_id))
+      return bundle_id
+    end
+  end
+
+  local exact_candidates = {}
+  if name and name ~= "" then
+    exact_candidates[1] = name
+  end
+  for _, candidate in ipairs(name_candidates) do
+    exact_candidates[#exact_candidates + 1] = candidate
+  end
+  for _, candidate in ipairs(exact_candidates) do
+    local exact_id = Companion.find_app_by_exact_name(candidate)
+    if exact_id then
+      Log.debug("mini app resolved from app list: " .. tostring(candidate) ..
+        " -> " .. tostring(exact_id))
+      return exact_id
+    end
+  end
+
   local dynamic_id, err = Companion.find_app_by_name(name)
   if dynamic_id then
     Log.debug("mini app resolved from app list: " .. tostring(name) .. " -> " .. tostring(dynamic_id))
     return dynamic_id
   end
+
+  for _, candidate in ipairs(name_candidates) do
+    local platform_id = Companion.find_app_by_name(candidate)
+    if platform_id then
+      Log.debug("mini app resolved from platform name: " .. tostring(candidate) ..
+        " -> " .. tostring(platform_id))
+      return platform_id
+    end
+  end
+
   if err then
     Log.error("mini app app-list match failed: " .. tostring(err))
   end
@@ -5179,9 +5248,63 @@ function C4MiniApps.resolve_bound_minidriver(input)
   return {
     service_id = C4MiniApps.get_relevant_universal_app_id(app_device_id, C4MiniApps.MINIAPP_TYPE),
     name = C4MiniApps.get_relevant_universal_app_id(app_device_id, "APP_NAME"),
+    service_ids = C4MiniApps.collect_service_ids(app_device_id),
     app_proxy_id = app_proxy_id,
     app_device_id = app_device_id,
   }
+end
+
+-- Control4's Mini App drivers publish one service id per TV platform (UM_ROKU,
+-- UM_NV_SHIELD, UM_SONY_TV, ...) and no Apple TV key at all -- MINIAPP_TYPE
+-- never resolves against a stock one, and neither does the APP_ID fallback. So
+-- the only field this driver could read was APP_NAME, which carries whatever
+-- Apple called the app when the Mini App driver was authored: the stock ESPN
+-- driver still says "WatchESPN", a name Apple has retired.
+--
+-- The other platforms' values are better evidence. Android and Apple often
+-- share a reverse-DNS bundle id (com.espn.score_center / com.espn.ScoreCenter),
+-- and the name-shaped entries are frequently current where APP_NAME is stale
+-- (that same driver carries UM_SONY_TV = "ESPN").
+function C4MiniApps.collect_service_ids(device_id)
+  if not (has_c4() and C4.GetDeviceVariables) then
+    return {}
+  end
+  local ok, vars = pcall(function() return C4:GetDeviceVariables(device_id) end)
+  if not ok then
+    return {}
+  end
+  local values, seen = {}, {}
+  for _, var in pairs(vars or {}) do
+    local var_name = tostring(var and var.name or "")
+    local value = var and var.value
+    if var_name:match("^UM_") and type(value) == "string" and value ~= "" and not seen[value] then
+      seen[value] = true
+      values[#values + 1] = value
+    end
+  end
+  -- GetDeviceVariables has no defined order; sort so resolution is repeatable.
+  table.sort(values)
+  return values
+end
+
+-- Splits collected service ids into bundle-id and name candidates. A few
+-- platforms prefix the id with a launch verb ("APP_LAUNCH com.apple.appletv");
+-- the prefix is stripped only when it is all-caps and what follows is
+-- id-shaped, so an ordinary two-word name like "Apple TV" is left alone.
+function C4MiniApps.split_service_ids(service_ids)
+  local bundles, names = {}, {}
+  for _, value in ipairs(service_ids or {}) do
+    local stripped = value:match("^[%u_]+%s+(%S+)$")
+    if stripped and stripped:find(".", 1, true) then
+      value = stripped
+    end
+    if value:find(".", 1, true) and not value:find(" ", 1, true) then
+      bundles[#bundles + 1] = value
+    else
+      names[#names + 1] = value
+    end
+  end
+  return bundles, names
 end
 
 function C4MiniApps.resolve_miniapp_service(binding_id, params)
