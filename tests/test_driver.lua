@@ -2506,6 +2506,27 @@ function tests.opack_launch_request_roundtrip()
   assert_table_has(decoded_request._c, "_bundleID", "com.netflix.Netflix")
 end
 
+function tests.opack_decodes_extended_scalar_and_containers()
+  assert_eq(Driver.OPACK.decode(string.char(0x07)), -1, "0x07 small integer")
+
+  local endless_data = Driver.OPACK.decode(string.char(
+    0x9F,
+    0x72, 0xAA, 0xBB,
+    0x71, 0xCC,
+    0x03
+  ))
+  assert_eq(endless_data.__opack_type, "bytes", "0x9f returns bytes")
+  assert_eq(Driver.Bytes.hex(endless_data.data), "aabbcc", "0x9f joins byte chunks")
+
+  local flagged_dict = Driver.OPACK.decode(string.char(
+    0xF2,
+    0x41, string.byte("a"), 0x09,
+    0x41, string.byte("b"), 0x0A
+  ))
+  assert_eq(flagged_dict.a, 1, "0xf2 first entry")
+  assert_eq(flagged_dict.b, 2, "0xf2 second entry")
+end
+
 function tests.opack_requests_match_pyatv_source_vectors()
   local vectors = {
     {
@@ -3050,11 +3071,54 @@ function tests.find_app_by_name_prefers_the_entry_carrying_the_request()
     { name = "Sports Center", identifier = "com.a.one" },
     { name = "Sports Centre", identifier = "com.b.two" },
   }
-  local ambiguous, ambiguous_err = Driver.Companion.find_app_by_name("Sports Cent")
-  assert_eq(ambiguous, nil, "ambiguous request unresolved")
-  assert(ambiguous_err and ambiguous_err:match("fuzzily match"), "ambiguity reported")
+  local tied = Driver.Companion.find_app_by_name("Sports Cent")
+  assert_eq(tied, "com.a.one", "equal display-name scores use stable bundle-id tiebreak")
 
   Driver.Companion.app_list = old_app_list
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
+function tests.find_app_by_name_uses_exact_prefix_fuzzy_and_bundle_tiebreaks()
+  local old_app_rows = Driver.Companion.app_list_rows
+
+  Driver.Companion.app_list_rows = {
+    { name = "Apple TV", identifier = "com.example.apple-tv-catalog" },
+    { name = "Apple TV", identifier = "com.apple.TVWatchList" },
+    { name = "TV", identifier = "com.example.generic-tv" },
+  }
+  assert_eq(Driver.Companion.find_app_by_name("Apple TV", "com.apple.TVWatchList"),
+    "com.apple.TVWatchList", "exact duplicate uses preferred bundle id")
+
+  Driver.Companion.app_list_rows = {
+    { name = "MLB", identifier = "com.mlb.AtBatUniversal" },
+    { name = "TV", identifier = "com.apple.TVWatchList" },
+  }
+  assert_eq(Driver.Companion.find_app_by_name("MLB TV"), "com.mlb.AtBatUniversal",
+    "leading prefix wins over generic suffix")
+
+  Driver.Companion.app_list_rows = {
+    { name = "HBO Max", identifier = "com.wbd.stream" },
+  }
+  assert_eq(Driver.Companion.find_app_by_name("Max"), "com.wbd.stream",
+    "fuzzy containment remains the final fallback")
+
+  Driver.Companion.app_list_rows = old_app_rows
+end
+
+function tests.mini_app_apple_tv_uses_alias_bundle_to_break_exact_name_tie()
+  local old_app_rows = Driver.Companion.app_list_rows
+  Driver.Companion.app_list_rows = {
+    { name = "Apple TV", identifier = "com.example.apple-tv-catalog" },
+    { name = "Apple TV", identifier = "com.apple.TVWatchList" },
+  }
+
+  local resolved = Driver.C4MiniApps.resolve_launch_id({
+    name = "Apple TV",
+    service_id = "Apple TV",
+  })
+  assert_eq(resolved, "com.apple.TVWatchList",
+    "Apple TV mini app selects the alias bundle when display names tie")
+
   Driver.Companion.app_list_rows = old_app_rows
 end
 

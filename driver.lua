@@ -737,8 +737,8 @@ local function opack_ordered_entries(value)
 end
 
 -- Minimal OPACK subset (pyatv's documentation):
---   0x01 true, 0x02 false, 0x08+n small int, 0x40+n short string,
---   0x70+n short bytes, 0xE0+n dict of n pairs.
+--   0x01 true, 0x02 false, 0x07 -1, 0x08+n small int,
+--   0x40+n short string, 0x70+n short bytes, 0xE0+n dict of n pairs.
 -- Golden-vector tests must pass before expanding this.
 local function opack_reuse_or_store(packed_bytes, object_list)
   if #packed_bytes <= 1 then
@@ -984,6 +984,9 @@ local function opack_decode_at(data, index, object_list)
     opack_store_unique(object_list, value)
     return value, index + 9
   end
+  if marker == 0x07 then
+    return -1, index + 1
+  end
   if marker >= 0x08 and marker <= 0x2F then
     return marker - 0x08, index + 1
   end
@@ -1052,6 +1055,29 @@ local function opack_decode_at(data, index, object_list)
     opack_store_unique(object_list, wrapped)
     return wrapped, value_start + length
   end
+  if marker == 0x9F then
+    -- Indefinite raw data is encoded as ordinary OPACK byte-string chunks and
+    -- terminated by 0x03. Decode each chunk through the shared object table so
+    -- pointers after the collection retain the same indexes as CoreUtils.
+    local chunks = {}
+    index = index + 1
+    while true do
+      local next_marker = data:byte(index)
+      assert(next_marker, "truncated OPACK endless data")
+      if next_marker == 0x03 then
+        index = index + 1
+        break
+      end
+      local chunk
+      chunk, index = opack_decode_at(data, index, object_list)
+      assert(type(chunk) == "table" and chunk.__opack_type == "bytes",
+        "OPACK endless data chunk must be bytes")
+      chunks[#chunks + 1] = chunk.data
+    end
+    local wrapped = OPACK.bytes(table.concat(chunks))
+    opack_store_unique(object_list, wrapped)
+    return wrapped, index
+  end
   if marker >= 0xD0 and marker <= 0xDF then
     local count = marker - 0xD0
     local result = {}
@@ -1073,8 +1099,10 @@ local function opack_decode_at(data, index, object_list)
     return result, index
   end
 
-  if marker >= 0xE0 and marker <= 0xEF then
-    local count = marker - 0xE0
+  if marker >= 0xE0 then
+    -- CoreUtils also emits the flagged 0xF0 family. Its low nibble carries the
+    -- same entry count as 0xE0 (for example 0xF2 is a two-entry container).
+    local count = marker % 0x10
     local result = {}
     index = index + 1
     if count == 0x0F then  -- endless dictionary terminated by 0x03
@@ -3412,30 +3440,12 @@ function Companion.resolve_app_selection(selection)
   if selection == "" then return nil end
   if Companion.app_list[selection] then return selection end
 
-  local exact_name_match
   for _, app in ipairs(Companion.app_list_rows or {}) do
-    if selection == Companion.app_display_name(app) or selection == app.name then
-      if selection == app.name and exact_name_match and exact_name_match ~= app.identifier then
-        return nil, "multiple apps match name " .. selection .. "; select the full app entry"
-      end
-      exact_name_match = app.identifier
+    if selection == Companion.app_display_name(app) then
+      return app.identifier
     end
   end
-  if exact_name_match then return exact_name_match end
-
-  local needle = selection:lower()
-  local fuzzy_match
-  for _, app in ipairs(Companion.app_list_rows or {}) do
-    local name = tostring(app.name or ""):lower()
-    local identifier = tostring(app.identifier or ""):lower()
-    if name:find(needle, 1, true) or identifier:find(needle, 1, true) then
-      if fuzzy_match and fuzzy_match ~= app.identifier then
-        return nil, "multiple apps match " .. selection .. "; select the full app entry"
-      end
-      fuzzy_match = app.identifier
-    end
-  end
-  return fuzzy_match
+  return Companion.find_app_by_name(selection)
 end
 
 function Companion.normalize_app_name(name)
@@ -3476,20 +3486,53 @@ function Companion.fuzzy_match_score(needle, candidate)
   return nil
 end
 
-function Companion.find_app_by_exact_name(name)
+local function app_bundle_tiebreak_score(app, normalized_name, preferred_bundle_id)
+  local normalized_id = Companion.normalize_app_name(app and app.identifier)
+  local normalized_preferred = Companion.normalize_app_name(preferred_bundle_id)
+  if normalized_preferred ~= "" and normalized_id == normalized_preferred then
+    return 10000
+  end
+  if normalized_id == normalized_name then
+    return 9000
+  end
+  local at = normalized_id:find(normalized_name, 1, true)
+  if at then
+    return 8000 - math.min(#normalized_id - #normalized_name, 999) - math.min(at - 1, 99)
+  end
+  return 0
+end
+
+local function choose_app_candidate(candidates, normalized_name, preferred_bundle_id)
+  if #candidates == 0 then return nil end
+  table.sort(candidates, function(a, b)
+    if a.match_score ~= b.match_score then
+      return a.match_score > b.match_score
+    end
+    local a_bundle_score = app_bundle_tiebreak_score(a, normalized_name, preferred_bundle_id)
+    local b_bundle_score = app_bundle_tiebreak_score(b, normalized_name, preferred_bundle_id)
+    if a_bundle_score ~= b_bundle_score then
+      return a_bundle_score > b_bundle_score
+    end
+    return tostring(a.identifier or ""):lower() < tostring(b.identifier or ""):lower()
+  end)
+  return candidates[1].identifier
+end
+
+function Companion.find_app_by_exact_name(name, preferred_bundle_id)
   local normalized = Companion.normalize_app_name(name)
   if normalized == "" then return nil end
 
-  local exact_match
+  local matches = {}
   for _, app in ipairs(Companion.app_list_rows or {}) do
     if Companion.normalize_app_name(app.name) == normalized then
-      if exact_match and exact_match ~= app.identifier then
-        return nil, "multiple apps match name " .. tostring(name)
-      end
-      exact_match = app.identifier
+      matches[#matches + 1] = {
+        name = app.name,
+        identifier = app.identifier,
+        match_score = 1,
+      }
     end
   end
-  return exact_match
+  return choose_app_candidate(matches, normalized, preferred_bundle_id)
 end
 
 -- com.espn.score_center and com.espn.ScoreCenter normalize alike, which is how
@@ -3510,15 +3553,36 @@ function Companion.find_app_by_bundle_id(bundle_id)
   return match
 end
 
-function Companion.find_app_by_name(name)
-  local exact_match, exact_err = Companion.find_app_by_exact_name(name)
+function Companion.find_app_by_name(name, preferred_bundle_id)
+  local exact_match = Companion.find_app_by_exact_name(name, preferred_bundle_id)
   if exact_match then return exact_match end
-  if exact_err then return nil, exact_err end
 
   local normalized = Companion.normalize_app_name(name)
-  if #normalized < 4 then return nil end
+  if #normalized < 3 then return nil end
 
-  local best_match, best_score, tied
+  -- Prefixes are less surprising than containment: "MLB" is the leading
+  -- identity in "MLB TV", while the generic "TV" suffix is not.
+  local prefix_matches = {}
+  for _, app in ipairs(Companion.app_list_rows or {}) do
+    local candidate = Companion.normalize_app_name(app.name)
+    local score
+    if candidate:sub(1, #normalized) == normalized then
+      score = 2000 - math.min(#candidate - #normalized, 999)
+    elseif #candidate >= 3 and normalized:sub(1, #candidate) == candidate then
+      score = 1000 + math.min(#candidate, 999)
+    end
+    if score then
+      prefix_matches[#prefix_matches + 1] = {
+        name = app.name,
+        identifier = app.identifier,
+        match_score = score,
+      }
+    end
+  end
+  local prefix_match = choose_app_candidate(prefix_matches, normalized, preferred_bundle_id)
+  if prefix_match then return prefix_match end
+
+  local fuzzy_matches = {}
   for _, app in ipairs(Companion.app_list_rows or {}) do
     local score = Companion.fuzzy_match_score(normalized, Companion.normalize_app_name(app.name))
     if not score then
@@ -3528,18 +3592,14 @@ function Companion.find_app_by_name(name)
       end
     end
     if score then
-      if not best_score or score > best_score then
-        best_match, best_score, tied = app.identifier, score, false
-      elseif score == best_score and app.identifier ~= best_match then
-        tied = true
-      end
+      fuzzy_matches[#fuzzy_matches + 1] = {
+        name = app.name,
+        identifier = app.identifier,
+        match_score = score,
+      }
     end
   end
-
-  if tied then
-    return nil, "multiple apps fuzzily match " .. tostring(name)
-  end
-  return best_match
+  return choose_app_candidate(fuzzy_matches, normalized, preferred_bundle_id)
 end
 
 function Companion.render_current_app(app)
@@ -4631,6 +4691,17 @@ function C4MiniApps.alias_for(name)
   return nil
 end
 
+function C4MiniApps.exact_alias_for(name)
+  local normalized = Companion.normalize_app_name(name)
+  if normalized == "" then return nil end
+  for alias, bundle_id in pairs(C4MiniApps.aliases or {}) do
+    if Companion.normalize_app_name(alias) == normalized then
+      return bundle_id, alias
+    end
+  end
+  return nil
+end
+
 function C4MiniApps.resolve_launch_id(service)
   service = service or {}
   local service_id = service.service_id
@@ -4651,6 +4722,7 @@ function C4MiniApps.resolve_launch_id(service)
   end
 
   local bundle_candidates, name_candidates = C4MiniApps.split_service_ids(service.service_ids)
+  local preferred_bundle_id = C4MiniApps.exact_alias_for(name)
 
   for _, candidate in ipairs(bundle_candidates) do
     local bundle_id = Companion.find_app_by_bundle_id(candidate)
@@ -4669,7 +4741,8 @@ function C4MiniApps.resolve_launch_id(service)
     exact_candidates[#exact_candidates + 1] = candidate
   end
   for _, candidate in ipairs(exact_candidates) do
-    local exact_id = Companion.find_app_by_exact_name(candidate)
+    local exact_id = Companion.find_app_by_exact_name(candidate,
+      candidate == name and preferred_bundle_id or nil)
     if exact_id then
       Log.debug("mini app resolved from app list: " .. tostring(candidate) ..
         " -> " .. tostring(exact_id))
@@ -4677,7 +4750,7 @@ function C4MiniApps.resolve_launch_id(service)
     end
   end
 
-  local dynamic_id, err = Companion.find_app_by_name(name)
+  local dynamic_id = Companion.find_app_by_name(name, preferred_bundle_id)
   if dynamic_id then
     Log.debug("mini app resolved from app list: " .. tostring(name) .. " -> " .. tostring(dynamic_id))
     return dynamic_id
@@ -4690,10 +4763,6 @@ function C4MiniApps.resolve_launch_id(service)
         " -> " .. tostring(platform_id))
       return platform_id
     end
-  end
-
-  if err then
-    Log.error("mini app app-list match failed: " .. tostring(err))
   end
 
   local alias_id, alias_name, alias_err = C4MiniApps.alias_for(name)
