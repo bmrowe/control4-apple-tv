@@ -1587,6 +1587,68 @@ function tests.execute_command_routes_driver_commands()
   Properties = old_properties
 end
 
+function tests.programming_remote_buttons_send_hid_commands()
+  local cases = {
+    { command = "Home", hid = 7 },
+    { command = "Menu", hid = 5 },
+    { command = "Guide", hid = 17 },
+    { command = "Select", hid = 6 },
+    { command = "Play/Pause", hid = 14 },
+    { command = "Channel Up", hid = 15 },
+    { command = "Channel Down", hid = 16 },
+    { command = "Volume Up", hid = 8 },
+    { command = "Volume Down", hid = 9 },
+    { command = "Page Up", hid = 18 },
+    { command = "Page Down", hid = 19 },
+    { command = "Sleep", hid = 12 },
+    { command = "Wake", hid = 13 },
+  }
+
+  for _, case in ipairs(cases) do
+    Driver.Companion.sent_messages = {}
+    ExecuteCommand(case.command, {})
+    assert_eq(#Driver.Companion.sent_messages, 2, case.command .. " sends a tap")
+    assert_eq(Driver.Companion.sent_messages[1]._c._hidC, case.hid, case.command .. " press hid")
+    assert_eq(Driver.Companion.sent_messages[1]._c._hBtS, 1, case.command .. " press state")
+    assert_eq(Driver.Companion.sent_messages[2]._c._hBtS, 2, case.command .. " release state")
+  end
+
+  Driver.Companion.sent_messages = {}
+  ExecuteCommand("CHANNEL_UP", {})
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 15, "underscore alias resolves")
+
+  Driver.Companion.sent_messages = {}
+  ExecuteCommand("App Switcher", {})
+  assert_eq(#Driver.Companion.sent_messages, 4, "app switcher double taps home")
+  assert_eq(Driver.Companion.sent_messages[4]._c._hidC, 7, "app switcher home hid")
+end
+
+function tests.programming_control_center_holds_home()
+  local old_c4 = C4
+  local old_set_timer = SetTimer
+  local timers = {}
+  C4 = { KillTimer = function() end }
+  SetTimer = function(name, interval, callback)
+    timers[#timers + 1] = { name = name, interval = interval, callback = callback }
+    return name
+  end
+
+  Driver.Companion.sent_messages = {}
+  ExecuteCommand("Control Center", {})
+  assert_eq(#Driver.Companion.sent_messages, 1, "hold presses without releasing")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hidC, 7, "hold home hid")
+  assert_eq(Driver.Companion.sent_messages[1]._c._hBtS, 1, "hold press state")
+  assert_eq(#timers, 1, "hold arms a release timer")
+  assert_eq(timers[1].interval, Driver.Companion.hold_ms, "hold uses the configured duration")
+
+  timers[1].callback()
+  assert_eq(#Driver.Companion.sent_messages, 2, "hold releases on timer")
+  assert_eq(Driver.Companion.sent_messages[2]._c._hBtS, 2, "hold release state")
+
+  C4 = old_c4
+  SetTimer = old_set_timer
+end
+
 function tests.programming_launch_app_resolves_property_style_selection()
   local old_properties = Properties
   Properties = { ["Launch App"] = "", ["Current App"] = "" }

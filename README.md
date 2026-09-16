@@ -101,6 +101,22 @@ and Prime Video are also aliased.
 - `Start AirPlay Monitor` / `Stop AirPlay Monitor`: manually control the AirPlay metadata
   monitor, which otherwise starts on its own once AirPlay credentials are available.
 
+## Programming Commands
+
+Device Specific Commands in the Programming tab, for buttons Control4 does not route
+as proxy commands (`CONTROL4`, `PREV`) and for programming with no remote behind it.
+
+- `Home`, `Menu`, `Guide`, `Select`, `Play/Pause`
+- `Channel Up` / `Channel Down`: used by live-TV apps such as Channels DVR.
+- `Volume Up` / `Volume Down`: useful when the Apple TV outputs to HomePods and owns
+  its own volume.
+- `Page Up` / `Page Down`
+- `Control Center`: holds TV/Home for one second.
+- `App Switcher`: double-presses TV/Home.
+- `Sleep` / `Wake`
+- `Launch App` / `Launch App By ID`: `Launch App` offers the list populated by
+  `Refresh App List`; `Launch App By ID` takes a typed bundle id or URL.
+
 ## Key Properties
 
 - `After Mini App Launch`: choose `Return To This Driver` or `Select Native Apple TV Driver`.

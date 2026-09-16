@@ -805,6 +805,66 @@
                     </param>
                 </params>
             </command>
+            <command>
+                <name>Home</name>
+                <description>Send TV/Home to the Apple TV</description>
+            </command>
+            <command>
+                <name>Menu</name>
+                <description>Send Menu (Back) to the Apple TV</description>
+            </command>
+            <command>
+                <name>Guide</name>
+                <description>Send Guide to the Apple TV</description>
+            </command>
+            <command>
+                <name>Select</name>
+                <description>Send Select to the Apple TV</description>
+            </command>
+            <command>
+                <name>Play/Pause</name>
+                <description>Send Play/Pause to the Apple TV</description>
+            </command>
+            <command>
+                <name>Channel Up</name>
+                <description>Send Channel Up to the Apple TV</description>
+            </command>
+            <command>
+                <name>Channel Down</name>
+                <description>Send Channel Down to the Apple TV</description>
+            </command>
+            <command>
+                <name>Volume Up</name>
+                <description>Send Volume Up to the Apple TV</description>
+            </command>
+            <command>
+                <name>Volume Down</name>
+                <description>Send Volume Down to the Apple TV</description>
+            </command>
+            <command>
+                <name>Page Up</name>
+                <description>Send Page Up to the Apple TV</description>
+            </command>
+            <command>
+                <name>Page Down</name>
+                <description>Send Page Down to the Apple TV</description>
+            </command>
+            <command>
+                <name>Control Center</name>
+                <description>Open Control Center (hold TV/Home)</description>
+            </command>
+            <command>
+                <name>App Switcher</name>
+                <description>Open the app switcher (double press TV/Home)</description>
+            </command>
+            <command>
+                <name>Sleep</name>
+                <description>Put the Apple TV to sleep</description>
+            </command>
+            <command>
+                <name>Wake</name>
+                <description>Wake the Apple TV</description>
+            </command>
         </commands>
     </config>
     <composer_categories>

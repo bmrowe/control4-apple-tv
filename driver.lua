@@ -2831,6 +2831,10 @@ local Companion = {
   menu_tap_last_at_ms = nil,
   menu_tap_grace_ms = 250,
   menu_tap_timer = "AppleTV_menu_tap_on_select",
+  -- tvOS reads a hold from the gap between _hBtS 1 and 2, so Control Center
+  -- needs a real delay rather than a second tap.
+  hold_timer = "AppleTV_hid_hold",
+  hold_ms = 1000,
   tv_system_status_logged = nil,
   launch = {
     timer = "AppleTV_launch_confirm",
@@ -3708,7 +3712,11 @@ local HID_COMMANDS = {
   SLEEP = 12,
   WAKE = 13,
   PLAY_PAUSE = 14,
+  CHANNEL_UP = 15,
+  CHANNEL_DOWN = 16,
   GUIDE = 17,
+  PAGE_UP = 18,
+  PAGE_DOWN = 19,
 }
 
 function Companion.button(name, state, options)
@@ -7907,7 +7915,35 @@ function C4Driver.cancel_driver_timers()
   C4Driver.cancel_timer("AppleTV_airplay_monitor_start_watchdog")
   C4Driver.cancel_timer(Companion.launch.timer)
   C4Driver.cancel_timer(Companion.menu_tap_timer)
+  C4Driver.cancel_timer(Companion.hold_timer)
   MDNS.cancel_all()
+end
+
+function C4Driver.button_hold(name, duration_ms)
+  local down = Companion.button(name, 1)
+  if not (has_c4() and type(SetTimer) == "function") then
+    return { down, Companion.button(name, 2) }
+  end
+  C4Driver.cancel_timer(Companion.hold_timer)
+  local ok, err = pcall(SetTimer, Companion.hold_timer, duration_ms or Companion.hold_ms, function()
+    Companion.button(name, 2)
+  end)
+  if not ok then
+    Log.debug("HID hold timer unavailable: " .. tostring(err))
+    return { down, Companion.button(name, 2) }
+  end
+  return { down }
+end
+
+function C4Driver.send_remote_button(hid, action, hold)
+  if Companion.credentials or (Driver.state and Driver.state.companion_credentials) then
+    C4Driver.ensure_companion_client()
+  end
+  C4Driver.ensure_airplay_monitor_for_room("device specific command")
+  if hold then
+    return C4Driver.button_hold(hid)
+  end
+  return Companion.button_action(hid, action)
 end
 
 -- EC: Composer action and command dispatch (DCP normalises spaces→underscores and handles LUA_ACTION)
@@ -7961,6 +7997,34 @@ EC.IMPORT_AIRPLAY_CREDENTIALS = function(params)
 end
 EC.PAIR_COMPANION = function()
   return C4Driver.pair_companion()
+end
+
+-- Device Specific Commands, for buttons Control4 never routes as proxy commands
+-- (CONTROL4, PREV) and for programming that has no remote behind it.
+C4Driver.remote_buttons = {
+  ["Home"] = { "HOME" },
+  ["Menu"] = { "MENU" },
+  ["Guide"] = { "GUIDE" },
+  ["Select"] = { "SELECT" },
+  ["Play/Pause"] = { "PLAY_PAUSE" },
+  ["Channel Up"] = { "CHANNEL_UP" },
+  ["Channel Down"] = { "CHANNEL_DOWN" },
+  ["Volume Up"] = { "VOLUME_UP" },
+  ["Volume Down"] = { "VOLUME_DOWN" },
+  ["Page Up"] = { "PAGE_UP" },
+  ["Page Down"] = { "PAGE_DOWN" },
+  ["Control Center"] = { "HOME", hold = true },
+  ["App Switcher"] = { "HOME", action = "double" },
+  ["Sleep"] = { "SLEEP" },
+  ["Wake"] = { "WAKE" },
+}
+
+for name, entry in pairs(C4Driver.remote_buttons) do
+  local handler = function()
+    return C4Driver.send_remote_button(entry[1], entry.action, entry.hold)
+  end
+  EC[(name:gsub("%s+", "_"))] = handler
+  EC[(name:upper():gsub("[%s/]", "_"))] = handler
 end
 
 function C4Driver.init()
