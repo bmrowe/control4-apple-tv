@@ -1166,7 +1166,9 @@ do
   -- Director always provides a bit module; there is deliberately no pure-Lua
   -- substitute. The one we used to fall back on ran ChaCha20 ~30-47x slower
   -- while logging nothing, and refusing to load is easier to diagnose.
-  local ops = bit32 or bit
+  -- Under LuaJIT prefer its built-in bit, which the compiler inlines; calls
+  -- into a C bit32 module would abort every trace.
+  local ops = (jit and bit) or bit32 or bit
   assert(ops, "Apple TV driver requires a native bit library (bit32 or bit); " ..
     "Director normally provides one. ChaCha20 cannot run without it.")
   Bit32.band = ops.band
@@ -1174,208 +1176,94 @@ do
   Bit32.bxor = ops.bxor
   Bit32.lshift = ops.lshift
   Bit32.rshift = ops.rshift
-end
-
-function Bit32.add(a, b)
-  return (a + b) % 0x100000000
-end
-
-function Bit32.rotl(a, n)
-  return Bit32.bor(Bit32.lshift(a, n), Bit32.rshift(a, 32 - n))
+  Bit32.rol = ops.rol or ops.lrotate or function(v, n)
+    return ops.bor(ops.lshift(v, n), ops.rshift(v, 32 - n))
+  end
 end
 
 local ChaCha20Poly1305Pure = {}
-local _CHACHA_CONST = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 }
-local _POLY1305_LIMB_BASE = 8192
-local _POLY1305_POW2 = {}
-for _i = 0, 13 do _POLY1305_POW2[_i] = 2 ^ _i end
+local _U32 = 4294967296
+local _bxor, _rol, _floor, _char = Bit32.bxor, Bit32.rol, math.floor, string.char
 
-local function _read_u32_le(s, offset)
-  local b1, b2, b3, b4 = s:byte(offset, offset + 3)
-  return b1 + b2 * 0x100 + b3 * 0x10000 + b4 * 0x1000000
+local function _le32(s, i)
+  local b1, b2, b3, b4 = s:byte(i, i + 3)
+  return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
 end
 
-local function _write_u32_le(v)
-  v = v % 0x100000000
-  return string.char(
-    v % 0x100,
-    math.floor(v / 0x100) % 0x100,
-    math.floor(v / 0x10000) % 0x100,
-    math.floor(v / 0x1000000) % 0x100
-  )
+local function _le32_words(s, n)
+  local w = {}
+  for i = 0, n - 1 do w[i] = _le32(s, 4 * i + 1) end
+  return w
 end
 
-local function _quarter_round(x, a, b, c, d)
-  x[a] = Bit32.add(x[a], x[b]); x[d] = Bit32.rotl(Bit32.bxor(x[d], x[a]), 16)
-  x[c] = Bit32.add(x[c], x[d]); x[b] = Bit32.rotl(Bit32.bxor(x[b], x[c]), 12)
-  x[a] = Bit32.add(x[a], x[b]); x[d] = Bit32.rotl(Bit32.bxor(x[d], x[a]), 8)
-  x[c] = Bit32.add(x[c], x[d]); x[b] = Bit32.rotl(Bit32.bxor(x[b], x[c]), 7)
+-- One ChaCha20 block into ks[0..15] as unsigned words. State lives in locals,
+-- not tables: ~4x faster interpreted, ~3.5x under LuaJIT.
+local function _chacha_block(ks, k, ctr, nw)
+  local M = _U32
+  local s0, s1, s2, s3 = 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574
+  local s4, s5, s6, s7, s8, s9, s10, s11 = k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]
+  local s12, s13, s14, s15 = ctr, nw[0], nw[1], nw[2]
+  local x0, x1, x2, x3, x4, x5, x6, x7 = s0, s1, s2, s3, s4, s5, s6, s7
+  local x8, x9, x10, x11, x12, x13, x14, x15 = s8, s9, s10, s11, s12, s13, s14, s15
+  for _ = 1, 10 do
+    x0 = (x0 + x4) % M; x12 = _rol(_bxor(x12, x0), 16); x8 = (x8 + x12) % M; x4 = _rol(_bxor(x4, x8), 12)
+    x0 = (x0 + x4) % M; x12 = _rol(_bxor(x12, x0), 8);  x8 = (x8 + x12) % M; x4 = _rol(_bxor(x4, x8), 7)
+    x1 = (x1 + x5) % M; x13 = _rol(_bxor(x13, x1), 16); x9 = (x9 + x13) % M; x5 = _rol(_bxor(x5, x9), 12)
+    x1 = (x1 + x5) % M; x13 = _rol(_bxor(x13, x1), 8);  x9 = (x9 + x13) % M; x5 = _rol(_bxor(x5, x9), 7)
+    x2 = (x2 + x6) % M; x14 = _rol(_bxor(x14, x2), 16); x10 = (x10 + x14) % M; x6 = _rol(_bxor(x6, x10), 12)
+    x2 = (x2 + x6) % M; x14 = _rol(_bxor(x14, x2), 8);  x10 = (x10 + x14) % M; x6 = _rol(_bxor(x6, x10), 7)
+    x3 = (x3 + x7) % M; x15 = _rol(_bxor(x15, x3), 16); x11 = (x11 + x15) % M; x7 = _rol(_bxor(x7, x11), 12)
+    x3 = (x3 + x7) % M; x15 = _rol(_bxor(x15, x3), 8);  x11 = (x11 + x15) % M; x7 = _rol(_bxor(x7, x11), 7)
+    x0 = (x0 + x5) % M; x15 = _rol(_bxor(x15, x0), 16); x10 = (x10 + x15) % M; x5 = _rol(_bxor(x5, x10), 12)
+    x0 = (x0 + x5) % M; x15 = _rol(_bxor(x15, x0), 8);  x10 = (x10 + x15) % M; x5 = _rol(_bxor(x5, x10), 7)
+    x1 = (x1 + x6) % M; x12 = _rol(_bxor(x12, x1), 16); x11 = (x11 + x12) % M; x6 = _rol(_bxor(x6, x11), 12)
+    x1 = (x1 + x6) % M; x12 = _rol(_bxor(x12, x1), 8);  x11 = (x11 + x12) % M; x6 = _rol(_bxor(x6, x11), 7)
+    x2 = (x2 + x7) % M; x13 = _rol(_bxor(x13, x2), 16); x8 = (x8 + x13) % M; x7 = _rol(_bxor(x7, x8), 12)
+    x2 = (x2 + x7) % M; x13 = _rol(_bxor(x13, x2), 8);  x8 = (x8 + x13) % M; x7 = _rol(_bxor(x7, x8), 7)
+    x3 = (x3 + x4) % M; x14 = _rol(_bxor(x14, x3), 16); x9 = (x9 + x14) % M; x4 = _rol(_bxor(x4, x9), 12)
+    x3 = (x3 + x4) % M; x14 = _rol(_bxor(x14, x3), 8);  x9 = (x9 + x14) % M; x4 = _rol(_bxor(x4, x9), 7)
+  end
+  ks[0], ks[1], ks[2], ks[3] = (x0 + s0) % M, (x1 + s1) % M, (x2 + s2) % M, (x3 + s3) % M
+  ks[4], ks[5], ks[6], ks[7] = (x4 + s4) % M, (x5 + s5) % M, (x6 + s6) % M, (x7 + s7) % M
+  ks[8], ks[9], ks[10], ks[11] = (x8 + s8) % M, (x9 + s9) % M, (x10 + s10) % M, (x11 + s11) % M
+  ks[12], ks[13], ks[14], ks[15] = (x12 + s12) % M, (x13 + s13) % M, (x14 + s14) % M, (x15 + s15) % M
+end
+
+local function _u32_le_bytes(v)
+  return _char(v % 256, _floor(v / 256) % 256, _floor(v / 65536) % 256, _floor(v / 16777216))
 end
 
 function ChaCha20Poly1305Pure.block(key, counter, nonce)
   assert(#key == 32 and #nonce == 12, "ChaCha20 key/nonce length invalid")
-  local state = {
-    _CHACHA_CONST[1], _CHACHA_CONST[2], _CHACHA_CONST[3], _CHACHA_CONST[4],
-    _read_u32_le(key, 1), _read_u32_le(key, 5), _read_u32_le(key, 9), _read_u32_le(key, 13),
-    _read_u32_le(key, 17), _read_u32_le(key, 21), _read_u32_le(key, 25), _read_u32_le(key, 29),
-    counter % 0x100000000, _read_u32_le(nonce, 1), _read_u32_le(nonce, 5), _read_u32_le(nonce, 9),
-  }
-  local x = {}
-  for i = 1, 16 do x[i] = state[i] end
-  for _ = 1, 10 do
-    _quarter_round(x, 1, 5, 9, 13)
-    _quarter_round(x, 2, 6, 10, 14)
-    _quarter_round(x, 3, 7, 11, 15)
-    _quarter_round(x, 4, 8, 12, 16)
-    _quarter_round(x, 1, 6, 11, 16)
-    _quarter_round(x, 2, 7, 12, 13)
-    _quarter_round(x, 3, 8, 9, 14)
-    _quarter_round(x, 4, 5, 10, 15)
-  end
-  local out = {}
-  for i = 1, 16 do out[i] = _write_u32_le(Bit32.add(x[i], state[i])) end
+  local ks, out = {}, {}
+  _chacha_block(ks, _le32_words(key, 8), counter % _U32, _le32_words(nonce, 3))
+  for i = 0, 15 do out[i + 1] = _u32_le_bytes(ks[i]) end
   return table.concat(out)
 end
 
 function ChaCha20Poly1305Pure.chacha20_xor(key, nonce, initial_counter, data)
-  local out, pos, counter = {}, 1, initial_counter
-  local chunk = {}
-  while pos <= #data do
-    local block = ChaCha20Poly1305Pure.block(key, counter, nonce)
-    local n = math.min(64, #data - pos + 1)
-    -- Per-byte reads: LuaJIT can't compile { s:byte(i, j) }, which cost 3.5x here.
-    local base = pos - 1
-    for i = 1, n do
-      chunk[i] = string.char(Bit32.bxor(data:byte(base + i), block:byte(i)))
+  assert(#key == 32 and #nonce == 12, "ChaCha20 key/nonce length invalid")
+  local k, nw, ks, out = _le32_words(key, 8), _le32_words(nonce, 3), {}, {}
+  local len, pos, o, counter = #data, 1, 0, initial_counter % _U32
+  while pos <= len do
+    _chacha_block(ks, k, counter, nw)
+    for w = 0, 15 do
+      if pos > len then break end
+      local v = ks[w]
+      if pos + 3 <= len then
+        o = o + 1
+        out[o] = _u32_le_bytes(_bxor(v, _le32(data, pos)) % _U32)
+        pos = pos + 4
+      else
+        while pos <= len do
+          o = o + 1
+          out[o] = _char(_bxor(v % 256, data:byte(pos)))
+          v = _floor(v / 256)
+          pos = pos + 1
+        end
+      end
     end
-    for i = n + 1, 64 do chunk[i] = nil end
-    out[#out + 1] = table.concat(chunk)
-    pos = pos + n
-    counter = (counter + 1) % 0x100000000
-  end
-  return table.concat(out)
-end
-
-local function _poly1305_clamp(r)
-  local b = { r:byte(1, 16) }
-  return string.char(
-    b[1], b[2], b[3], Bit32.band(b[4], 15),
-    Bit32.band(b[5], 252), b[6], b[7], Bit32.band(b[8], 15),
-    Bit32.band(b[9], 252), b[10], b[11], Bit32.band(b[12], 15),
-    Bit32.band(b[13], 252), b[14], b[15], Bit32.band(b[16], 15)
-  )
-end
-
-local function _poly1305_limbs_from_le_bytes(s)
-  local limbs, acc, bits = {}, 0, 0
-  for i = 1, #s do
-    acc = acc + s:byte(i) * _POLY1305_POW2[bits]
-    bits = bits + 8
-    while bits >= 13 and #limbs < 10 do
-      limbs[#limbs + 1] = acc % _POLY1305_LIMB_BASE
-      acc = math.floor(acc / _POLY1305_LIMB_BASE)
-      bits = bits - 13
-    end
-  end
-  if #limbs < 10 then
-    limbs[#limbs + 1] = acc
-  end
-  while #limbs < 10 do
-    limbs[#limbs + 1] = 0
-  end
-  return limbs
-end
-
-local function _poly1305_block_limbs(block)
-  if #block < 16 then
-    block = block .. "\1" .. string.rep("\0", 16 - #block)
-  else
-    block = block .. "\1"
-  end
-  return _poly1305_limbs_from_le_bytes(block)
-end
-
-local function _poly1305_carry(h)
-  local carry
-  for _ = 1, 2 do
-    for i = 1, 9 do
-      carry = math.floor(h[i] / _POLY1305_LIMB_BASE)
-      h[i] = h[i] % _POLY1305_LIMB_BASE
-      h[i + 1] = h[i + 1] + carry
-    end
-    carry = math.floor(h[10] / _POLY1305_LIMB_BASE)
-    h[10] = h[10] % _POLY1305_LIMB_BASE
-    h[1] = h[1] + carry * 5
-  end
-end
-
-local function _poly1305_ge_p(h)
-  if h[10] ~= _POLY1305_LIMB_BASE - 1 then
-    return h[10] > _POLY1305_LIMB_BASE - 1
-  end
-  for i = 9, 2, -1 do
-    if h[i] ~= _POLY1305_LIMB_BASE - 1 then
-      return h[i] > _POLY1305_LIMB_BASE - 1
-    end
-  end
-  return h[1] >= _POLY1305_LIMB_BASE - 5
-end
-
-local function _poly1305_sub_p(h)
-  h[1] = h[1] + 5
-  local carry = math.floor(h[1] / _POLY1305_LIMB_BASE)
-  h[1] = h[1] % _POLY1305_LIMB_BASE
-  for i = 2, 10 do
-    h[i] = h[i] + carry
-    carry = math.floor(h[i] / _POLY1305_LIMB_BASE)
-    h[i] = h[i] % _POLY1305_LIMB_BASE
-  end
-end
-
-local function _poly1305_mul_mod(h, r)
-  local d = {}
-  for i = 1, 10 do d[i] = 0 end
-  for i = 1, 10 do
-    local hi = 11 - i
-    for j = 1, hi do
-      local k = i + j - 1
-      d[k] = d[k] + h[i] * r[j]
-    end
-    for j = hi + 1, 10 do
-      local k = i + j - 11
-      d[k] = d[k] + h[i] * r[j] * 5
-    end
-  end
-  _poly1305_carry(d)
-  if _poly1305_ge_p(d) then
-    _poly1305_sub_p(d)
-  end
-  return d
-end
-
-local function _poly1305_low128(h)
-  local out, acc, bits = {}, 0, 0
-  for i = 1, 10 do
-    acc = acc + h[i] * _POLY1305_POW2[bits]
-    bits = bits + 13
-    while bits >= 8 and #out < 16 do
-      out[#out + 1] = acc % 256
-      acc = math.floor(acc / 256)
-      bits = bits - 8
-    end
-  end
-  while #out < 16 do
-    out[#out + 1] = 0
-  end
-  return out
-end
-
-local function _poly1305_add_s(h, s)
-  local out, carry = _poly1305_low128(h), 0
-  for i = 1, 16 do
-    local sum = out[i] + s:byte(i) + carry
-    out[i] = string.char(sum % 256)
-    carry = math.floor(sum / 256)
+    counter = (counter + 1) % _U32
   end
   return table.concat(out)
 end
@@ -1386,22 +1274,80 @@ local function _pad16(s)
   return string.rep("\0", 16 - rem)
 end
 
+-- Poly1305 over 6 x 22-bit limbs; 2^132 = 4 * 2^130 == 20 (mod p). Worst-case
+-- column sum is 6 * 2^23 * 20 * 2^22 < 2^52, exact in doubles.
 function ChaCha20Poly1305Pure.poly1305_mac(msg, one_time_key)
   assert(type(one_time_key) == "string" and #one_time_key == 32, "Poly1305 one-time key must be 32 bytes")
-  local r = _poly1305_limbs_from_le_bytes(_poly1305_clamp(one_time_key:sub(1, 16)))
-  local h = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
-  local pos = 1
-  while pos <= #msg do
-    local n = _poly1305_block_limbs(msg:sub(pos, pos + 15))
-    for i = 1, 10 do h[i] = h[i] + n[i] end
-    h = _poly1305_mul_mod(h, r)
+  local floor, B22, B20 = _floor, 4194304, 1048576
+  local key = one_time_key
+  local w0, w1, w2, w3 = _le32(key, 1) % 268435456, _le32(key, 5) % 268435456,
+    _le32(key, 9) % 268435456, _le32(key, 13) % 268435456
+  w1, w2, w3 = w1 - w1 % 4, w2 - w2 % 4, w3 - w3 % 4
+  local r0 = w0 % B22
+  local r1 = floor(w0 / B22) + (w1 % 4096) * 1024
+  local r2 = floor(w1 / 4096) + (w2 % 4) * B20
+  local r3 = floor(w2 / 4) % B22
+  local r4 = floor(w2 / 16777216) + (w3 % 16384) * 256
+  local r5 = floor(w3 / 16384)
+  local t1, t2, t3, t4, t5 = r1 * 20, r2 * 20, r3 * 20, r4 * 20, r5 * 20
+  local h0, h1, h2, h3, h4, h5 = 0, 0, 0, 0, 0, 0
+  local len, pos = #msg, 1
+  while pos <= len do
+    local hibit = 262144
+    if pos + 15 <= len then
+      w0, w1, w2, w3 = _le32(msg, pos), _le32(msg, pos + 4), _le32(msg, pos + 8), _le32(msg, pos + 12)
+    else
+      local blk = msg:sub(pos) .. "\1" .. string.rep("\0", 15 - (len - pos + 1))
+      w0, w1, w2, w3 = _le32(blk, 1), _le32(blk, 5), _le32(blk, 9), _le32(blk, 13)
+      hibit = 0
+    end
+    h0 = h0 + w0 % B22
+    h1 = h1 + floor(w0 / B22) + (w1 % 4096) * 1024
+    h2 = h2 + floor(w1 / 4096) + (w2 % 4) * B20
+    h3 = h3 + floor(w2 / 4) % B22
+    h4 = h4 + floor(w2 / 16777216) + (w3 % 16384) * 256
+    h5 = h5 + floor(w3 / 16384) + hibit
+    local d0 = h0 * r0 + h1 * t5 + h2 * t4 + h3 * t3 + h4 * t2 + h5 * t1
+    local d1 = h0 * r1 + h1 * r0 + h2 * t5 + h3 * t4 + h4 * t3 + h5 * t2
+    local d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * t5 + h4 * t4 + h5 * t3
+    local d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * t5 + h5 * t4
+    local d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0 + h5 * t5
+    local d5 = h0 * r5 + h1 * r4 + h2 * r3 + h3 * r2 + h4 * r1 + h5 * r0
+    local c
+    c = floor(d0 / B22); h0 = d0 - c * B22; d1 = d1 + c
+    c = floor(d1 / B22); h1 = d1 - c * B22; d2 = d2 + c
+    c = floor(d2 / B22); h2 = d2 - c * B22; d3 = d3 + c
+    c = floor(d3 / B22); h3 = d3 - c * B22; d4 = d4 + c
+    c = floor(d4 / B22); h4 = d4 - c * B22; d5 = d5 + c
+    c = floor(d5 / B22); h5 = d5 - c * B22; h0 = h0 + c * 20
+    c = floor(h0 / B22); h0 = h0 - c * B22; h1 = h1 + c
     pos = pos + 16
   end
-  _poly1305_carry(h)
-  if _poly1305_ge_p(h) then
-    _poly1305_sub_p(h)
+  -- fold bits >= 130 back in, carry fully, then subtract p if h >= p
+  local c = floor(h5 / B20); h5 = h5 - c * B20; h0 = h0 + c * 5
+  c = floor(h0 / B22); h0 = h0 - c * B22; h1 = h1 + c
+  c = floor(h1 / B22); h1 = h1 - c * B22; h2 = h2 + c
+  c = floor(h2 / B22); h2 = h2 - c * B22; h3 = h3 + c
+  c = floor(h3 / B22); h3 = h3 - c * B22; h4 = h4 + c
+  c = floor(h4 / B22); h4 = h4 - c * B22; h5 = h5 + c
+  c = floor(h5 / B20); h5 = h5 - c * B20; h0 = h0 + c * 5
+  local g0 = h0 + 5
+  c = floor(g0 / B22); g0 = g0 - c * B22
+  local g1 = h1 + c; c = floor(g1 / B22); g1 = g1 - c * B22
+  local g2 = h2 + c; c = floor(g2 / B22); g2 = g2 - c * B22
+  local g3 = h3 + c; c = floor(g3 / B22); g3 = g3 - c * B22
+  local g4 = h4 + c; c = floor(g4 / B22); g4 = g4 - c * B22
+  local g5 = h5 + c
+  if g5 >= B20 then
+    h0, h1, h2, h3, h4, h5 = g0, g1, g2, g3, g4, g5 - B20
   end
-  return _poly1305_add_s(h, one_time_key:sub(17, 32))
+  -- tag = (h + s) mod 2^128
+  local o0 = h0 + (h1 % 1024) * B22 + _le32(key, 17)
+  local o1 = floor(h1 / 1024) + (h2 % B20) * 4096 + _le32(key, 21) + floor(o0 / _U32)
+  local o2 = floor(h2 / B20) + h3 * 4 + (h4 % 256) * 16777216 + _le32(key, 25) + floor(o1 / _U32)
+  local o3 = floor(h4 / 256) + (h5 % 262144) * 16384 + _le32(key, 29) + floor(o2 / _U32)
+  return _u32_le_bytes(o0 % _U32) .. _u32_le_bytes(o1 % _U32) ..
+    _u32_le_bytes(o2 % _U32) .. _u32_le_bytes(o3 % _U32)
 end
 
 function ChaCha20Poly1305Pure.encrypt(key, nonce, plaintext, aad)
