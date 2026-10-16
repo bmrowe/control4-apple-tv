@@ -1804,6 +1804,9 @@ function SRP.compute_session_key(B_bytes, a_bytes, x, u)
   local bn = _srp_bn()
   local N = SRP.N
   local B_big = bn.text(B_bytes)
+  -- RFC 5054 2.6: abort if B % N == 0 or u == 0.
+  if bn.iszero(bn.mod(B_big, N)) then error("SRP: server public value B is 0 mod N", 2) end
+  if bn.iszero(u) then error("SRP: scrambling parameter u is 0", 2) end
   local a = bn.text(a_bytes)
   local k_big = bn.text(SRP._k_bytes)
   Log.debug("Pair-Setup M3 progress: SRP g^x started")
@@ -1970,12 +1973,7 @@ function Crypto.decrypt(input_key, ciphertext, aad, nonce)
 end
 
 function Crypto.random_bytes(n)
-  if Crypto.provider and type(Crypto.provider.random_bytes) == "function" then
-    return Crypto.provider.random_bytes(n)
-  end
-  local bytes = {}
-  for i = 1, n do bytes[i] = string.char(math.random(0, 255)) end
-  return table.concat(bytes)
+  return crypto_method(Crypto, "random_bytes")(n)
 end
 
 function Crypto.generate_ed25519_keypair()
@@ -4156,7 +4154,7 @@ function CompanionClient:on_ready_for_commands()
 end
 
 function CompanionClient:start_session()
-  local random_bytes = optional_crypto_method(self.crypto, "random_bytes") or Crypto.random_bytes
+  local random_bytes = optional_crypto_method(self.crypto, "random_bytes") or OpenSSLCrypto.random_bytes
   local sid_bytes = random_bytes(4)
   assert(type(sid_bytes) == "string" and #sid_bytes == 4, "session SID random source returned wrong length")
   self.session_local_sid = sid_bytes:byte(1) +
@@ -8028,7 +8026,6 @@ for name, entry in pairs(C4Driver.remote_buttons) do
 end
 
 function C4Driver.init()
-  math.randomseed(os.time())
   Driver.state = Storage.load()
   DEBUGPRINT = Properties and Properties["Debug Mode"] == "On"
   Companion.app_list = Driver.state.app_list or {}

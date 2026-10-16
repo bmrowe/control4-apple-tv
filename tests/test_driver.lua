@@ -4981,6 +4981,27 @@ function tests.srp_vectors_match_pyatv_srptools()
   end
 end
 
+function tests.srp_session_key_rejects_degenerate_b_and_u()
+  local bn = require("openssl").bn
+  local a_bytes = string.rep("\1", 32)
+  local x, u = bn.number(7), bn.number(3)
+  local zero_b = string.rep("\0", 384)
+  local ok, err = pcall(Driver.SRP.compute_session_key, zero_b, a_bytes, x, u)
+  assert(not ok and tostring(err):find("B is 0 mod N"), "B == 0 aborts: " .. tostring(err))
+  ok, err = pcall(Driver.SRP.compute_session_key, Driver.SRP.N_BYTES, a_bytes, x, u)
+  assert(not ok and tostring(err):find("B is 0 mod N"), "B == N aborts: " .. tostring(err))
+  ok, err = pcall(Driver.SRP.compute_session_key, string.rep("\0", 383) .. "\2", a_bytes, x, bn.number(0))
+  assert(not ok and tostring(err):find("u is 0"), "u == 0 aborts: " .. tostring(err))
+end
+
+function tests.crypto_random_bytes_requires_provider()
+  local old = Driver.Crypto.provider
+  Driver.Crypto.provider = nil
+  local ok, err = pcall(Driver.Crypto.random_bytes, 16)
+  Driver.Crypto.provider = old
+  assert(not ok and tostring(err):find("random_bytes"), "no math.random fallback: " .. tostring(err))
+end
+
 function tests.opack_array_encode_decode()
   -- Encode an array with 3 elements
   local arr = Driver.OPACK.array({1, "hello", true})
