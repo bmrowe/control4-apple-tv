@@ -24,6 +24,16 @@ local function has_c4()
   return C4 ~= nil and C4 ~= _C4_STUB
 end
 
+local function clock_ms()
+  if has_c4() and C4.GetTime then
+    local ok, value = pcall(C4.GetTime, C4)
+    if ok and type(value) == "number" then
+      return value
+    end
+  end
+  return (os.time() or 0) * 1000
+end
+
 local Log = {}
 
 -- Arguments are evaluated before the call, so Log.debug's early-out cannot save
@@ -156,12 +166,7 @@ MDNS.queue = {}
 MDNS.in_flight = false
 MDNS.started_at_ms = nil
 
-function MDNS.now_ms()
-  if C4Driver and C4Driver.now_ms then
-    return C4Driver.now_ms()
-  end
-  return (os.time() or 0) * 1000
-end
+MDNS.now_ms = clock_ms
 
 local function dns_encode_name(name)
   local out = {}
@@ -2060,17 +2065,11 @@ end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
 
--- C4Driver is declared further down, so read the clock directly.
-local function _aead_now_ms()
-  if has_c4() and C4.GetTime then return C4:GetTime() end
-  return os.clock() * 1000
-end
-
 local function _timed_aead(label, fn, key, nonce, data, aad)
   if not Log.is_debug() then return fn(key, nonce, data, aad or "") end
-  local started = _aead_now_ms()
+  local started = clock_ms()
   local out = fn(key, nonce, data, aad or "")
-  Log.debug("AEAD " .. label .. ": bytes=" .. #data .. " ms=" .. (_aead_now_ms() - started))
+  Log.debug("AEAD " .. label .. ": bytes=" .. #data .. " ms=" .. (clock_ms() - started))
   return out
 end
 
@@ -3813,7 +3812,7 @@ function CompanionClient:now_ms()
   if C4Driver and C4Driver.now_ms then
     return C4Driver.now_ms()
   end
-  return (os.time() or 0) * 1000
+  return clock_ms()
 end
 
 function CompanionClient:mark_tx()
@@ -4823,7 +4822,7 @@ function C4MiniApps.now_ms()
   if C4Driver and C4Driver.now_ms then
     return C4Driver.now_ms()
   end
-  return (os.time() or 0) * 1000
+  return clock_ms()
 end
 
 function C4MiniApps.is_duplicate_launch(launch_id)
@@ -6878,15 +6877,7 @@ function C4Driver.update_property_list(name, items)
   end
 end
 
-function C4Driver.now_ms()
-  if has_c4() and C4.GetTime then
-    local ok, value = pcall(function() return C4:GetTime() end)
-    if ok and type(value) == "number" then
-      return value
-    end
-  end
-  return (os.time() or 0) * 1000
-end
+C4Driver.now_ms = clock_ms
 
 function C4Driver.set_connection_state(value)
   C4Driver.set_companion_state(value)

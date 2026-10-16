@@ -3078,6 +3078,7 @@ function tests.mini_apps_and_companion_client_use_c4_wall_clock()
   local client = Driver.CompanionClient.new({})
   assert_eq(client:now_ms(), 123456, "Companion client wall clock")
   assert_eq(Driver.C4MiniApps.now_ms(), 123456, "mini app wall clock")
+  assert_eq(Driver.MDNS.now_ms(), 123456, "mDNS wall clock")
 
   C4 = old_c4
 end
