@@ -4995,6 +4995,71 @@ function tests.srp_session_key_rejects_degenerate_b_and_u()
   assert(not ok and tostring(err):find("u is 0"), "u == 0 aborts: " .. tostring(err))
 end
 
+function tests.x25519_lua_and_bn_ladders_match_reference_vectors()
+  -- RFC 7748 5.2 #2, a non-canonical u (top bit set), and random cases;
+  -- expected values from Python cryptography (OpenSSL).
+  local cases = {
+    { "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+      "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493",
+      "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957" },
+    { "6df36beef58ecd837d91878599c4a8717892a0eaa458181d9322f4e352fde7ca",
+      string.rep("ff", 32),
+      "6915951f999e6495f6d21cd6f588a26e23ee13d282b5335cb0a0b1d03d9be173" },
+    { "b0eb83aa9fe8d21fa0ba42a54b4f792f0e39038244fc088e0b93f2b3bdbf2b7c",
+      "f0f39fa55d1521cde0ce7861584e5147d9bfcc6a3eb262a013ec32454e20801c",
+      "de8207967197d4e28d876ccffee993c314c5e511e7b9244ea2a89d7b713e1d65" },
+    { "f4e6f0deabd86dad3a30920d36d4f90d46b5139285d694f2c6ea293da4c703e2",
+      "4b15ca5b67d65b8b98b77485ae523a2f62af01c7b9683037d8fdd1ab9a9661dd",
+      "0196e23a65eb651dede1bc50c0231ac3c92a674bc5c55982150bc80f1bb5eb2a" },
+  }
+  local B, X = Driver.Bytes, Driver.X25519Pure
+  local zero = string.rep("\0", 32)
+  for i, c in ipairs(cases) do
+    local k, u = B.from_hex(c[1]), B.from_hex(c[2])
+    assert_eq(B.hex(X.mul_lua(k, u)), c[3], "lua ladder case " .. i)
+    assert_eq(B.hex(X.mul_bn(k, u)), c[3], "bn ladder case " .. i)
+  end
+  local k = B.from_hex(cases[1][1])
+  assert_eq(X.mul_lua(k, zero), zero, "lua ladder low-order point")
+  assert_eq(X.mul_bn(k, zero), zero, "bn ladder low-order point")
+end
+
+function tests.ed25519_sign_and_verify_accept_good_and_reject_tampered()
+  -- RFC 8032 7.1 test 2 and a 420-byte message; expected values from Python cryptography.
+  local B, E = Driver.Bytes, Driver.Ed25519Pure
+  local cases = {
+    { "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", string.char(0x72),
+      "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da" ..
+      "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00" },
+    { "ec63885291d3f630cb1b5517c5cf941c7ea2e796399acf45dedde0323b983935",
+      "c51904be720a71e102a330bd9b91f8a9acea5b5d54495686ffa7e55a4030a134",
+      string.rep("Apple TV pair-verify ", 20),
+      "a3c62b20387f01d271f29d4fa05269e2569e7973aab53dd6425354ed16be8904" ..
+      "232ed89c7d968a854aaddb348a0267953ebdeadcb6a89134ab7eafb4b53f3b04" },
+  }
+  local function flip(s, i)
+    return s:sub(1, i - 1) .. string.char((s:byte(i) + 1) % 256) .. s:sub(i + 1)
+  end
+  for n, c in ipairs(cases) do
+    local seed, pub, msg, sig = B.from_hex(c[1]), B.from_hex(c[2]), c[3], B.from_hex(c[4])
+    local label = "case " .. n .. ": "
+    assert_eq(E.public_key_from_private(seed), pub, label .. "public key")
+    assert_eq(E.sign(seed, pub, msg), sig, label .. "sign")
+    assert_eq(E.sign_expanded(E.expand_private_key(seed), msg), sig, label .. "sign_expanded")
+    assert_eq(E.verify(pub, sig, msg), true, label .. "verify")
+    assert_eq(E.verify(pub, flip(sig, 1), msg), false, label .. "tampered R")
+    assert_eq(E.verify(pub, flip(sig, 40), msg), false, label .. "tampered S")
+    assert_eq(E.verify(pub, sig, msg .. "x"), false, label .. "wrong message")
+    assert_eq(E.verify(B.from_hex(cases[3 - n][2]), sig, msg), false, label .. "wrong key")
+    local bn = require("openssl").bn
+    local L = bn.text(B.from_hex("1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed"))
+    local s_plus_l = bn.totext(bn.add(bn.text(sig:sub(33):reverse()), L))
+    s_plus_l = (string.rep("\0", 32 - #s_plus_l) .. s_plus_l):reverse()
+    assert_eq(E.verify(pub, sig:sub(1, 32) .. s_plus_l, msg), false, label .. "non-canonical S")
+  end
+end
+
 function tests.chacha20_poly1305_matches_rfc8439_aead_vector()
   local B = Driver.Bytes
   local key = B.from_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")

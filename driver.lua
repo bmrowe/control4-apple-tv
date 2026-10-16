@@ -1531,7 +1531,7 @@ local function _le_bit(bytes, t)
 end
 
 -- ===== X25519 (Montgomery ladder, RFC 7748) =====
-function X25519Pure.mul(k_bytes, u_bytes)
+function X25519Pure.mul_bn(k_bytes, u_bytes)
   _ensure_curve()
   local ub = { u_bytes:byte(1, 32) }
   ub[32] = ub[32] % 128
@@ -1575,6 +1575,120 @@ end
 
 -- Base point u=9 in little-endian
 X25519Pure.BASE_POINT = string.char(9) .. string.rep("\0", 31)
+
+-- TweetNaCl-style 16 x 16-bit limb ladder. Under LuaJIT this compiles to a
+-- tight loop and beats the per-op bn calls; interpreted, bn is ~9x faster.
+do
+  local floor = math.floor
+  local PRIME = {
+    [0] = 0xffed, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x7fff,
+  }
+  local A24 = { [0] = 0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+
+  local function carry(o)
+    for i = 0, 15 do
+      o[i] = o[i] + 0x10000
+      local c = floor(o[i] / 0x10000)
+      if i < 15 then
+        o[i + 1] = o[i + 1] + c - 1
+      else
+        o[0] = o[0] + 38 * (c - 1)
+      end
+      o[i] = o[i] % 0x10000
+    end
+  end
+
+  local function swap(a, b, bit)
+    local inv = 1 - bit
+    for i = 0, 15 do
+      local ai, bi = a[i], b[i]
+      a[i] = ai * inv + bi * bit
+      b[i] = bi * inv + ai * bit
+    end
+  end
+
+  local function add(o, a, b) for i = 0, 15 do o[i] = a[i] + b[i] end end
+  local function sub(o, a, b) for i = 0, 15 do o[i] = a[i] - b[i] end end
+
+  local function mul(o, a, b, prod)
+    for i = 0, 31 do prod[i] = 0 end
+    for i = 0, 15 do
+      local ai = a[i]
+      for j = 0, 15 do prod[i + j] = prod[i + j] + ai * b[j] end
+    end
+    for i = 0, 14 do prod[i] = prod[i] + 38 * prod[i + 16] end
+    for i = 0, 15 do o[i] = prod[i] end
+    carry(o); carry(o)
+  end
+
+  -- a^(p-2) via the standard 2^255-21 addition chain
+  local function inv(o, a, prod)
+    local t, x2, x9, x11, x5, x10, x20, x50, x100 = {}, {}, {}, {}, {}, {}, {}, {}, {}
+    local function sqn(dst, src, n)
+      mul(dst, src, src, prod)
+      for _ = 2, n do mul(dst, dst, dst, prod) end
+    end
+    mul(x2, a, a, prod)
+    sqn(t, x2, 2); mul(x9, t, a, prod)
+    mul(x11, x9, x2, prod)
+    mul(t, x11, x11, prod); mul(x5, t, x9, prod)
+    sqn(t, x5, 5); mul(x10, t, x5, prod)
+    sqn(t, x10, 10); mul(x20, t, x10, prod)
+    sqn(t, x20, 20); mul(t, t, x20, prod)
+    sqn(t, t, 10); mul(x50, t, x10, prod)
+    sqn(t, x50, 50); mul(x100, t, x50, prod)
+    sqn(t, x100, 100); mul(t, t, x100, prod)
+    sqn(t, t, 50); mul(t, t, x50, prod)
+    sqn(t, t, 5); mul(o, t, x11, prod)
+  end
+
+  local function pack(a)
+    local t, m, out = {}, {}, {}
+    for i = 0, 15 do t[i] = a[i] end
+    carry(t); carry(t); carry(t)
+    for _ = 0, 1 do
+      m[0] = t[0] - PRIME[0]
+      for i = 1, 15 do
+        m[i] = t[i] - PRIME[i] - (floor(m[i - 1] / 0x10000) % 2)
+        m[i - 1] = m[i - 1] % 0x10000
+      end
+      swap(t, m, 1 - floor(m[15] / 0x10000) % 2)
+    end
+    for i = 0, 15 do
+      out[2 * i + 1] = string.char(t[i] % 0x100)
+      out[2 * i + 2] = string.char(floor(t[i] / 0x100))
+    end
+    return table.concat(out)
+  end
+
+  function X25519Pure.mul_lua(k_bytes, u_bytes)
+    local x, a, b, c, d, e, f, prod = {}, {}, {}, {}, {}, {}, {}, {}
+    local ub, kb = { u_bytes:byte(1, 32) }, { k_bytes:byte(1, 32) }
+    for i = 0, 15 do x[i] = ub[2 * i + 1] + ub[2 * i + 2] * 0x100 end
+    x[15] = x[15] % 0x8000
+    kb[1] = kb[1] - kb[1] % 8
+    kb[32] = kb[32] % 64 + 64
+    for i = 0, 15 do a[i], b[i], c[i], d[i] = 0, x[i], 0, 0 end
+    a[0], d[0] = 1, 1
+    for i = 254, 0, -1 do
+      local bit = floor(kb[floor(i / 8) + 1] / 2 ^ (i % 8)) % 2
+      swap(a, b, bit); swap(c, d, bit)
+      add(e, a, c); sub(a, a, c); add(c, b, d); sub(b, b, d)
+      mul(d, e, e, prod); mul(f, a, a, prod); mul(a, c, a, prod); mul(c, b, e, prod)
+      add(e, a, c); sub(a, a, c); mul(b, a, a, prod); sub(c, d, f)
+      mul(a, c, A24, prod); add(a, a, d); mul(c, c, a, prod); mul(a, d, f, prod)
+      mul(d, b, x, prod); mul(b, e, e, prod)
+      swap(a, b, bit); swap(c, d, bit)
+    end
+    inv(c, c, prod)
+    mul(a, a, c, prod)
+    return pack(a)
+  end
+end
+
+X25519Pure.mul = (type(jit) == "table" and jit.status and jit.status())
+  and X25519Pure.mul_lua or X25519Pure.mul_bn
 local Ed25519Pure = {}
 
 local function _sha512_bytes(data)
@@ -1633,16 +1747,51 @@ local function _point_double(pp)
   return { X = fmul(e, f), Y = fmul(g, h), Z = fmul(f, g), T = fmul(e, h) }
 end
 
--- scalar mult over a 32-byte little-endian scalar (double-and-add, no table)
-local function _scalar_mult(point, scalar_le)
-  _ensure_curve()
+-- 0..15 multiples of a point, for 4-bit fixed-window scalar multiplication
+local function _point_window(point)
+  local t = { [0] = _IDENT, point }
+  for i = 2, 15 do t[i] = _point_add(t[i - 1], point) end
+  return t
+end
+
+local _B_WINDOW
+
+local function _nibble(bytes, j)
+  local b = bytes[math.floor(j / 2) + 1]
+  if j % 2 == 0 then return b % 16 end
+  return math.floor(b / 16)
+end
+
+-- sum of [s]P over (window, 32-byte LE scalar) pairs, sharing the doublings
+-- (Shamir's trick when given two pairs)
+local function _multi_scalar_mult(pairs)
+  local digits = {}
+  for i = 1, #pairs do digits[i] = { pairs[i][2]:byte(1, 32) } end
   local r = _IDENT
-  local bytes = { scalar_le:byte(1, 32) }
-  for i = 255, 0, -1 do
-    r = _point_double(r)
-    if _le_bit(bytes, i) == 1 then r = _point_add(r, point) end
+  for j = 63, 0, -1 do
+    if r ~= _IDENT then
+      r = _point_double(_point_double(_point_double(_point_double(r))))
+    end
+    for i = 1, #pairs do
+      local d = _nibble(digits[i], j)
+      if d ~= 0 then
+        r = (r == _IDENT) and pairs[i][1][d] or _point_add(r, pairs[i][1][d])
+      end
+    end
   end
   return r
+end
+
+local function _scalar_mult(point, scalar_le)
+  _ensure_curve()
+  local window
+  if point == _B then
+    _B_WINDOW = _B_WINDOW or _point_window(_B)
+    window = _B_WINDOW
+  else
+    window = _point_window(point)
+  end
+  return _multi_scalar_mult({ { window, scalar_le } })
 end
 
 local function _point_equal(pp, qp)
@@ -1748,9 +1897,14 @@ function Ed25519Pure.verify(public_key, signature, message)
   local S = le_to_bn(signature:sub(33, 64))
   if _bn.compare(S, _L) >= 0 then return false end
   local k = _hash_scalar(_sha512_bytes(R .. public_key .. message))
-  local lhs = _scalar_mult(_B, bn_to_le(S, 32))
-  local rhs = _point_add(Rpt, _scalar_mult(A, bn_to_le(k, 32)))
-  return _point_equal(lhs, rhs)
+  -- [S]B == R + [k]A, checked as [S]B + [k](-A) == R in one shared pass
+  local neg_a = { X = fsub(_F0, A.X), Y = A.Y, Z = A.Z, T = fsub(_F0, A.T) }
+  _B_WINDOW = _B_WINDOW or _point_window(_B)
+  local sum = _multi_scalar_mult({
+    { _B_WINDOW, bn_to_le(S, 32) },
+    { _point_window(neg_a), bn_to_le(k, 32) },
+  })
+  return _point_equal(sum, Rpt)
 end
 
 function SRP.sha512(data)
