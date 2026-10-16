@@ -1243,12 +1243,10 @@ function ChaCha20Poly1305Pure.chacha20_xor(key, nonce, initial_counter, data)
   while pos <= #data do
     local block = ChaCha20Poly1305Pure.block(key, counter, nonce)
     local n = math.min(64, #data - pos + 1)
-    -- Extract via table constructors (O(n)); the former select()-based helper
-    -- was O(n^2) per block and this runs on every session frame.
-    local data_bytes = { data:byte(pos, pos + n - 1) }
-    local block_bytes = { block:byte(1, n) }
+    -- Per-byte reads: LuaJIT can't compile { s:byte(i, j) }, which cost 3.5x here.
+    local base = pos - 1
     for i = 1, n do
-      chunk[i] = string.char(Bit32.bxor(data_bytes[i], block_bytes[i]))
+      chunk[i] = string.char(Bit32.bxor(data:byte(base + i), block:byte(i)))
     end
     for i = n + 1, 64 do chunk[i] = nil end
     out[#out + 1] = table.concat(chunk)
