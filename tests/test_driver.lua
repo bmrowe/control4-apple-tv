@@ -4994,6 +4994,19 @@ function tests.srp_session_key_rejects_degenerate_b_and_u()
   assert(not ok and tostring(err):find("u is 0"), "u == 0 aborts: " .. tostring(err))
 end
 
+function tests.chacha20_poly1305_matches_rfc8439_aead_vector()
+  local B = Driver.Bytes
+  local key = B.from_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+  local nonce = B.from_hex("070000004041424344454647")
+  local aad = B.from_hex("50515253c0c1c2c3c4c5c6c7")
+  local pt = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip " ..
+    "for the future, sunscreen would be it."
+  local sealed = Driver.OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, pt, aad)
+  assert_eq(B.hex(sealed):sub(1, 32), "d31a8d34648e60db7b86afbc53ef7ec2", "ciphertext head")
+  assert_eq(B.hex(sealed):sub(-32), "1ae10b594f09e26a7e902ecbd0600691", "tag")
+  assert_eq(Driver.OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, sealed, aad), pt, "round trip")
+end
+
 function tests.crypto_random_bytes_requires_provider()
   local old = Driver.Crypto.provider
   Driver.Crypto.provider = nil

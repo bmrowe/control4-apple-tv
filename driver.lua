@@ -2060,16 +2060,30 @@ end
 
 OpenSSLCrypto._verify_ed25519 = OpenSSLCrypto._default_verify_ed25519
 
+-- C4Driver is declared further down, so read the clock directly.
+local function _aead_now_ms()
+  if has_c4() and C4.GetTime then return C4:GetTime() end
+  return os.clock() * 1000
+end
+
+local function _timed_aead(label, fn, key, nonce, data, aad)
+  if not Log.is_debug() then return fn(key, nonce, data, aad or "") end
+  local started = _aead_now_ms()
+  local out = fn(key, nonce, data, aad or "")
+  Log.debug("AEAD " .. label .. ": bytes=" .. #data .. " ms=" .. (_aead_now_ms() - started))
+  return out
+end
+
 function OpenSSLCrypto._chacha20_poly1305_encrypt(key, nonce, plaintext, aad)
   assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
   assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
-  return ChaCha20Poly1305Pure.encrypt(key, nonce, plaintext, aad or "")
+  return _timed_aead("encrypt", ChaCha20Poly1305Pure.encrypt, key, nonce, plaintext, aad)
 end
 
 function OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, ciphertext_and_tag, aad)
   assert(#key == 32, "ChaCha20-Poly1305 key must be 32 bytes")
   assert(#nonce == 12, "ChaCha20-Poly1305 nonce must be 12 bytes")
-  return ChaCha20Poly1305Pure.decrypt(key, nonce, ciphertext_and_tag, aad or "")
+  return _timed_aead("decrypt", ChaCha20Poly1305Pure.decrypt, key, nonce, ciphertext_and_tag, aad)
 end
 
 function OpenSSLCrypto.encrypt(output_key, plaintext, aad, nonce)
@@ -8026,6 +8040,8 @@ for name, entry in pairs(C4Driver.remote_buttons) do
 end
 
 function C4Driver.init()
+  Log.output("Lua runtime: " .. tostring(_VERSION) .. ", jit=" ..
+    (jit and (tostring(jit.version) .. " " .. ((jit.status()) and "on" or "off")) or "none"))
   Driver.state = Storage.load()
   DEBUGPRINT = Properties and Properties["Debug Mode"] == "On"
   Companion.app_list = Driver.state.app_list or {}
