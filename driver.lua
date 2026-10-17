@@ -745,6 +745,8 @@ end
 --   0x01 true, 0x02 false, 0x07 -1, 0x08+n small int,
 --   0x40+n short string, 0x70+n short bytes, 0xE0+n dict of n pairs.
 -- Golden-vector tests must pass before expanding this.
+-- Containers never take object-table slots: CoreUtils' decoder (and pyatv's
+-- unpack) skips them, unlike pyatv's pack, whose later pointers then drift.
 -- Private key on an object list for its lookup index; a linear scan per value
 -- made large messages quadratic (seconds on the controller).
 local _OPACK_INDEX = {}
@@ -810,8 +812,7 @@ function OPACK._encode(value, object_list)
       out[#out + 1] = OPACK._encode(entry[1], object_list)
       out[#out + 1] = OPACK._encode(entry[2], object_list)
     end
-    packed_bytes = table.concat(out)
-    return opack_reuse_or_store(packed_bytes, object_list)
+    return table.concat(out)
   end
 
   if value_type == "table" and value.__opack_type == "array" then
@@ -826,8 +827,7 @@ function OPACK._encode(value, object_list)
       out[#out + 1] = OPACK._encode(elem, object_list)
     end
     if n >= 15 then out[#out + 1] = string.char(0x03) end
-    packed_bytes = table.concat(out)
-    return opack_reuse_or_store(packed_bytes, object_list)
+    return table.concat(out)
   end
 
   if value_type == "table" and value.__opack_type == "int64" then
@@ -895,8 +895,7 @@ function OPACK._encode(value, object_list)
       out[#out + 1] = OPACK._encode(entry[1], object_list)
       out[#out + 1] = OPACK._encode(entry[2], object_list)
     end
-    packed_bytes = table.concat(out)
-    return opack_reuse_or_store(packed_bytes, object_list)
+    return table.concat(out)
   end
 
   error("unsupported OPACK type: " .. value_type)

@@ -5158,6 +5158,28 @@ function tests.opack_encoder_reuses_values_by_position()
   for i = 1, 42 do assert_eq(round[i], values[i], "round trip " .. i) end
 end
 
+function tests.opack_encoder_leaves_containers_out_of_object_table()
+  local O, B = Driver.OPACK, Driver.Bytes
+  -- Expected bytes decode to the input under pyatv's unpack. pyatv's pack instead
+  -- emits a7 for the second [1, 2] and aa for "later", which its unpack rejects.
+  local encoded = O.encode(O.dict({
+    { "a", O.dict({ { "k", "v" } }) },
+    { "b", O.dict({ { "k", "v" } }) },
+    { "c", O.array({ 1, 2 }) },
+    { "d", O.array({ 1, 2 }) },
+    { "e", "later" },
+    { "f", "later" },
+  }))
+  assert_eq(B.hex(encoded),
+    "e64161e1416b41764162e1a1a24163d2090a4164d2090a4165456c617465724166a7", "container bytes")
+  local d = O.decode(encoded)
+  assert_eq(d.a.k, "v", "first dict")
+  assert_eq(d.b.k, "v", "repeated dict")
+  assert_eq(d.c[2], 2, "first array")
+  assert_eq(d.d[1] + d.d[2], 3, "repeated array")
+  assert_eq(d.f, "later", "reference after containers")
+end
+
 function tests.opack_duplicate_literals_do_not_shift_object_references()
   local encoded = "\xd4" .. "\x41a" .. "\x41a" .. "\x41b" .. "\xa1"
   local decoded = Driver.OPACK.decode(encoded)
