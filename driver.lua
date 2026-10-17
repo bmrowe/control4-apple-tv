@@ -745,28 +745,37 @@ end
 --   0x01 true, 0x02 false, 0x07 -1, 0x08+n small int,
 --   0x40+n short string, 0x70+n short bytes, 0xE0+n dict of n pairs.
 -- Golden-vector tests must pass before expanding this.
+-- Private key on an object list for its lookup index; a linear scan per value
+-- made large messages quadratic (seconds on the controller).
+local _OPACK_INDEX = {}
+
 local function opack_reuse_or_store(packed_bytes, object_list)
   if #packed_bytes <= 1 then
     return packed_bytes
   end
 
-  for index, existing in ipairs(object_list) do
-    if existing == packed_bytes then
-      local object_index = index - 1
-      if object_index < 0x21 then
-        return string.char(0xA0 + object_index)
-      end
-      if object_index <= 0xFF then
-        return string.char(0xC1, object_index)
-      end
-      if object_index <= 0xFFFF then
-        return string.char(0xC2, object_index % 0x100, math.floor(object_index / 0x100) % 0x100)
-      end
-      error("OPACK pointer index too large")
+  local positions = object_list[_OPACK_INDEX]
+  if not positions then
+    positions = {}
+    object_list[_OPACK_INDEX] = positions
+  end
+  local index = positions[packed_bytes]
+  if index then
+    local object_index = index - 1
+    if object_index < 0x21 then
+      return string.char(0xA0 + object_index)
     end
+    if object_index <= 0xFF then
+      return string.char(0xC1, object_index)
+    end
+    if object_index <= 0xFFFF then
+      return string.char(0xC2, object_index % 0x100, math.floor(object_index / 0x100) % 0x100)
+    end
+    error("OPACK pointer index too large")
   end
 
   object_list[#object_list + 1] = packed_bytes
+  positions[packed_bytes] = #object_list
   return packed_bytes
 end
 
@@ -946,9 +955,30 @@ local function opack_values_equal(a, b)
   return a == b
 end
 
+-- Same equality as opack_values_equal, via per-type lookups. Strings are
+-- interned, so keying by the value itself costs nothing extra.
 local function opack_store_unique(object_list, value)
-  for _, existing in ipairs(object_list) do
-    if opack_values_equal(existing, value) then return end
+  local seen = object_list[_OPACK_INDEX]
+  if not seen then
+    seen = { string = {}, number = {}, bytes = {} }
+    object_list[_OPACK_INDEX] = seen
+  end
+  local kind, key = type(value), value
+  local lookup
+  if kind == "string" then
+    lookup = seen.string
+  elseif kind == "number" and value == value then  -- NaN never equals itself
+    lookup = seen.number
+  elseif kind == "table" and value.__opack_type == "bytes" then
+    lookup, key = seen.bytes, value.data
+  end
+  if lookup then
+    if lookup[key] then return end
+    lookup[key] = true
+  elseif kind ~= "number" then
+    for _, existing in ipairs(object_list) do
+      if opack_values_equal(existing, value) then return end
+    end
   end
   object_list[#object_list + 1] = value
 end

@@ -5120,6 +5120,44 @@ function tests.opack_object_references_decode()
   assert_eq(decoded.copy, "_pd", "second object reference")
 end
 
+function tests.opack_references_keep_types_distinct_and_positions_stable()
+  local O, B = Driver.OPACK, Driver.Bytes
+  -- string "ab", bytes "ab", int 300, duplicate "ab", then refs to slots 0..2
+  local encoded = B.from_hex("d7" .. "426162" .. "726162" .. "312c01" .. "426162" .. "a0a1a2")
+  local d = O.decode(encoded)
+  assert_eq(d[1], "ab", "string literal")
+  assert_eq(d[2].data, "ab", "bytes literal with the same content")
+  assert_eq(d[3], 300, "int literal")
+  assert_eq(d[4], "ab", "duplicate literal")
+  assert_eq(d[5], "ab", "ref 0 is the string")
+  assert_eq(d[6].__opack_type, "bytes", "ref 1 stays bytes, not the equal string")
+  assert_eq(d[7], 300, "ref 2 is the int")
+
+  -- 40 unique strings, then two-byte references (0xC1) past the 33 short slots
+  local parts, values = { "df" }, {}
+  for i = 1, 40 do
+    values[i] = string.format("s%02d", i)
+    parts[#parts + 1] = "43" .. B.hex(values[i])
+  end
+  parts[#parts + 1] = "c127" .. "c121" .. "a5" .. "03"
+  local refs = O.decode(B.from_hex(table.concat(parts)))
+  assert_eq(refs[41], "s40", "C1 ref 39")
+  assert_eq(refs[42], "s34", "C1 ref 33")
+  assert_eq(refs[43], "s06", "short ref 5")
+end
+
+function tests.opack_encoder_reuses_values_by_position()
+  local O, B = Driver.OPACK, Driver.Bytes
+  assert_eq(B.hex(O.encode(O.array({ "ab", "cd", "ab", "cd" }))), "d4426162426364a0a1", "short refs")
+  local values = {}
+  for i = 1, 40 do values[i] = string.format("s%02d", i) end
+  values[41], values[42] = "s40", "s01"
+  local encoded = O.encode(O.array(values))
+  assert_eq(B.hex(encoded:sub(-4)), "c127a003", "C1 ref past 33 slots, short ref, end marker")
+  local round = O.decode(encoded)
+  for i = 1, 42 do assert_eq(round[i], values[i], "round trip " .. i) end
+end
+
 function tests.opack_duplicate_literals_do_not_shift_object_references()
   local encoded = "\xd4" .. "\x41a" .. "\x41a" .. "\x41b" .. "\xa1"
   local decoded = Driver.OPACK.decode(encoded)
