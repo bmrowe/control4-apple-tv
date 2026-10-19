@@ -5073,6 +5073,102 @@ function tests.chacha20_poly1305_matches_rfc8439_aead_vector()
   assert_eq(Driver.OpenSSLCrypto._chacha20_poly1305_decrypt(key, nonce, sealed, aad), pt, "round trip")
 end
 
+local RFC8439_CHACHA20 = {
+  key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  nonce = "000000000000004a00000000",
+  pt = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip " ..
+    "for the future, sunscreen would be it.",
+  ct = "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b" ..
+    "f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8" ..
+    "07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736" ..
+    "5af90bbf74a35be6b40b8eedf2785e42874d",
+}
+
+-- Runs fn with the keystream backend re-resolved against `openssl_module`
+-- (nil = whatever require finds), restoring both afterwards.
+local function with_chacha_backend(openssl_module, fn)
+  local C = Driver.ChaCha20Poly1305Pure
+  local saved_native, saved_module = C._native, package.loaded.openssl
+  if openssl_module ~= nil then package.loaded.openssl = openssl_module end
+  C._native = nil
+  local ok, err = pcall(fn, C)
+  C._native, package.loaded.openssl = saved_native, saved_module
+  if not ok then error(err, 0) end
+end
+
+local function assert_rfc8439_chacha20(C, label)
+  local B = Driver.Bytes
+  local v = RFC8439_CHACHA20
+  local key, nonce = B.from_hex(v.key), B.from_hex(v.nonce)
+  assert_eq(B.hex(C.chacha20(key, nonce, 1, v.pt)), v.ct, label .. " ChaCha20")
+  assert_eq(C.chacha20(key, nonce, 1, B.from_hex(v.ct)), v.pt, label .. " ChaCha20 inverse")
+  assert_eq(C.chacha20(key, nonce, 1, ""), "", label .. " empty")
+  tests.chacha20_poly1305_matches_rfc8439_aead_vector()
+end
+
+function tests.chacha20_lua_keystream_matches_rfc8439()
+  local B = Driver.Bytes
+  local v = RFC8439_CHACHA20
+  local C = Driver.ChaCha20Poly1305Pure
+  assert_eq(B.hex(C.chacha20_xor(B.from_hex(v.key), B.from_hex(v.nonce), 1, v.pt)), v.ct, "Lua ChaCha20")
+  with_chacha_backend({}, function()
+    assert_eq(C.keystream_backend(), "lua", "backend without openssl")
+    assert_rfc8439_chacha20(C, "lua")
+  end)
+end
+
+function tests.chacha20_native_keystream_passes_iv_as_counter_then_nonce()
+  local C = Driver.ChaCha20Poly1305Pure
+  local calls = 0
+  local stub = { cipher = { encrypt = function(alg, data, key, iv)
+    assert_eq(alg, "chacha20", "cipher name")
+    assert_eq(#iv, 16, "iv length")
+    calls = calls + 1
+    local b1, b2, b3, b4 = iv:byte(1, 4)
+    return C.chacha20_xor(key, iv:sub(5), b1 + b2 * 256 + b3 * 65536 + b4 * 16777216, data)
+  end } }
+  with_chacha_backend(stub, function()
+    assert_eq(C.keystream_backend(), "native", "stub adopted")
+    local before = calls
+    assert_rfc8439_chacha20(C, "native stub")
+    assert(calls > before, "native cipher used for frames")
+  end)
+end
+
+function tests.chacha20_rejects_native_cipher_that_fails_known_answer()
+  local C = Driver.ChaCha20Poly1305Pure
+  local wrong = { cipher = { encrypt = function(_, data) return data end } }
+  with_chacha_backend(wrong, function()
+    assert_eq(C.keystream_backend(), "lua", "wrong keystream rejected")
+    assert_rfc8439_chacha20(C, "rejected")
+  end)
+  local missing = { cipher = { encrypt = function() error("unsupported cipher") end } }
+  with_chacha_backend(missing, function()
+    assert_eq(C.keystream_backend(), "lua", "erroring cipher rejected")
+  end)
+end
+
+function tests.chacha20_falls_back_when_native_call_fails_later()
+  local C = Driver.ChaCha20Poly1305Pure
+  local fail = false
+  local stub = { cipher = { encrypt = function(_, data, key, iv)
+    if fail then return nil, "boom" end
+    return C.chacha20_xor(key, iv:sub(5), 1, data)
+  end } }
+  with_chacha_backend(stub, function()
+    assert_eq(C.keystream_backend(), "native", "stub adopted")
+    fail = true
+    assert_rfc8439_chacha20(C, "fallback")
+  end)
+end
+
+function tests.chacha20_real_openssl_keystream_is_native()
+  with_chacha_backend(nil, function(C)
+    assert(C.keystream_backend() == "native", "requires lua-openssl chacha20")
+    assert_rfc8439_chacha20(C, "openssl")
+  end)
+end
+
 function tests.crypto_random_bytes_requires_provider()
   local old = Driver.Crypto.provider
   Driver.Crypto.provider = nil

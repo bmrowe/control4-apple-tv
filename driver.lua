@@ -1379,10 +1379,47 @@ function ChaCha20Poly1305Pure.poly1305_mac(msg, one_time_key)
     _u32_le_bytes(o2 % _U32) .. _u32_le_bytes(o3 % _U32)
 end
 
+-- lua-openssl 0.8.5 can't feed AEAD AAD, but plain "chacha20" needs none
+-- (IV = LE counter .. nonce). Adopted only if it reproduces the Lua keystream.
+local function _resolve_native_chacha()
+  local ok, openssl = pcall(require, "openssl")
+  local encrypt = ok and type(openssl) == "table" and type(openssl.cipher) == "table"
+    and openssl.cipher.encrypt
+  if type(encrypt) ~= "function" then return false end
+  local function native(key, nonce, counter, data)
+    return encrypt("chacha20", data, key, _u32_le_bytes(counter) .. nonce)
+  end
+  local key = Bytes.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+  local nonce = Bytes.from_hex("000000000000004a00000000")
+  local probe = string.rep("\0", 80)
+  local ran, got = pcall(native, key, nonce, 1, probe)
+  if ran and got == ChaCha20Poly1305Pure.chacha20_xor(key, nonce, 1, probe) then return native end
+  return false
+end
+
+function ChaCha20Poly1305Pure.keystream_backend()
+  if ChaCha20Poly1305Pure._native == nil then
+    ChaCha20Poly1305Pure._native = _resolve_native_chacha()
+  end
+  return ChaCha20Poly1305Pure._native and "native" or "lua"
+end
+
+function ChaCha20Poly1305Pure.chacha20(key, nonce, counter, data)
+  assert(#key == 32 and #nonce == 12, "ChaCha20 key/nonce length invalid")
+  if #data == 0 then return "" end
+  if ChaCha20Poly1305Pure.keystream_backend() == "native" then
+    local ok, out = pcall(ChaCha20Poly1305Pure._native, key, nonce, counter % _U32, data)
+    if ok and type(out) == "string" and #out == #data then return out end
+  end
+  return ChaCha20Poly1305Pure.chacha20_xor(key, nonce, counter, data)
+end
+
+local _OTK_ZEROS = string.rep("\0", 32)
+
 function ChaCha20Poly1305Pure.encrypt(key, nonce, plaintext, aad)
   aad = aad or ""
-  local otk = ChaCha20Poly1305Pure.block(key, 0, nonce):sub(1, 32)
-  local ciphertext = ChaCha20Poly1305Pure.chacha20_xor(key, nonce, 1, plaintext)
+  local otk = ChaCha20Poly1305Pure.chacha20(key, nonce, 0, _OTK_ZEROS)
+  local ciphertext = ChaCha20Poly1305Pure.chacha20(key, nonce, 1, plaintext)
   local mac_data = aad .. _pad16(aad) .. ciphertext .. _pad16(ciphertext) ..
     Bytes.uint_le(#aad, 8) .. Bytes.uint_le(#ciphertext, 8)
   return ciphertext .. ChaCha20Poly1305Pure.poly1305_mac(mac_data, otk)
@@ -1390,7 +1427,7 @@ end
 
 function ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad)
   aad = aad or ""
-  local otk = ChaCha20Poly1305Pure.block(key, 0, nonce):sub(1, 32)
+  local otk = ChaCha20Poly1305Pure.chacha20(key, nonce, 0, _OTK_ZEROS)
   local mac_data = aad .. _pad16(aad) .. ciphertext .. _pad16(ciphertext) ..
     Bytes.uint_le(#aad, 8) .. Bytes.uint_le(#ciphertext, 8)
   return ChaCha20Poly1305Pure.poly1305_mac(mac_data, otk)
@@ -1402,7 +1439,7 @@ function ChaCha20Poly1305Pure.decrypt(key, nonce, ciphertext_and_tag, aad)
   local tag = ciphertext_and_tag:sub(#ciphertext_and_tag - 15)
   local expected = ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad or "")
   assert(tag == expected, "ChaCha20-Poly1305 authentication failed")
-  return ChaCha20Poly1305Pure.chacha20_xor(key, nonce, 1, ciphertext)
+  return ChaCha20Poly1305Pure.chacha20(key, nonce, 1, ciphertext)
 end
 
 -- SRP-6a with HAP parameters: RFC 3526 3072-bit prime, g=5, SHA-512.
@@ -8159,7 +8196,8 @@ end
 
 function C4Driver.init()
   Log.output("Lua runtime: " .. tostring(_VERSION) .. ", jit=" ..
-    (jit and (tostring(jit.version) .. " " .. ((jit.status()) and "on" or "off")) or "none"))
+    (jit and (tostring(jit.version) .. " " .. ((jit.status()) and "on" or "off")) or "none") ..
+    ", chacha20=" .. ChaCha20Poly1305Pure.keystream_backend())
   Driver.state = Storage.load()
   DEBUGPRINT = Properties and Properties["Debug Mode"] == "On"
   Companion.app_list = Driver.state.app_list or {}
