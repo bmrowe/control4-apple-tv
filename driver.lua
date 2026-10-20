@@ -2573,12 +2573,21 @@ function OpenSSLCrypto.random_bytes(n)
     return bytes
   end
 
-  local file, err = io.open("/dev/urandom", "rb")
-  assert(file, "secure random source unavailable: openssl.rand.bytes and /dev/urandom failed: " .. tostring(err))
-  local bytes = file:read(n)
-  file:close()
-  assert(type(bytes) == "string" and #bytes == n, "secure random source returned wrong length")
-  return bytes
+  -- One unbuffered handle for the driver's lifetime; reopened once if it fails.
+  for _ = 1, 2 do
+    if not OpenSSLCrypto._urandom then
+      local file, err = io.open("/dev/urandom", "rb")
+      assert(file, "secure random source unavailable: openssl.rand.bytes and /dev/urandom failed: " .. tostring(err))
+      file:setvbuf("no")
+      OpenSSLCrypto._urandom = file
+    end
+    local file = OpenSSLCrypto._urandom
+    local ok, bytes = pcall(file.read, file, n)
+    if ok and type(bytes) == "string" and #bytes == n then return bytes end
+    pcall(file.close, file)
+    OpenSSLCrypto._urandom = nil
+  end
+  error("secure random source returned wrong length")
 end
 
 function OpenSSLCrypto.generate_ed25519_keypair()

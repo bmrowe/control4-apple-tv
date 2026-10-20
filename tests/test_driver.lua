@@ -5482,6 +5482,29 @@ function tests.x25519_falls_back_when_native_misbehaves()
   end)
 end
 
+function tests.openssl_random_bytes_reuses_one_urandom_handle()
+  local O = Driver.OpenSSLCrypto
+  local saved_openssl, saved_handle = O.openssl, O._urandom
+  O.openssl, O._urandom = {}, nil
+  local ok, err = pcall(function()
+    local a, b = O.random_bytes(32), O.random_bytes(32)
+    assert_eq(#a, 32, "first length")
+    assert_eq(#b, 32, "second length")
+    assert(a ~= b, "fresh bytes each call")
+    local handle = O._urandom
+    assert(handle ~= nil, "handle kept open")
+    assert_eq(#O.random_bytes(4096), 4096, "large read")
+    assert_eq(O.random_bytes(0), "", "empty read")
+    assert(O._urandom == handle, "same handle reused")
+    handle:close()
+    assert_eq(#O.random_bytes(16), 16, "recovers from a closed handle")
+    assert(O._urandom ~= handle, "handle reopened")
+  end)
+  if O._urandom then O._urandom:close() end
+  O.openssl, O._urandom = saved_openssl, saved_handle
+  if not ok then error(err, 0) end
+end
+
 function tests.crypto_random_bytes_requires_provider()
   local old = Driver.Crypto.provider
   Driver.Crypto.provider = nil
