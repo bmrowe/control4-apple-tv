@@ -25,7 +25,8 @@ local function bench(label, fn)
 end
 
 local hook, mask, count = debug.gethook()
-print("runtime: " .. tostring(_VERSION) .. ", jit=" .. tostring(jit and jit.version) ..
+print("driver v" .. tostring(C4:GetDriverConfigInfo("version")) .. ", runtime: " .. tostring(_VERSION) ..
+  ", jit=" .. tostring(jit and jit.version) .. " status=" .. tostring(jit and (jit.status())) ..
   ", chacha20=" .. C.keystream_backend() ..
   ", tag backend=" .. C.tag_backend() .. ", NATIVE_TAG_MIN_BYTES=" .. tostring(C.NATIVE_TAG_MIN_BYTES))
 print("debug hook: " .. tostring(hook) .. " mask=" .. tostring(mask) .. " count=" .. tostring(count))
