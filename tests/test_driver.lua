@@ -5169,6 +5169,160 @@ function tests.chacha20_real_openssl_keystream_is_native()
   end)
 end
 
+local ED25519_TEST2 = {
+  seed = Driver.Bytes.from_hex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"),
+  pub = Driver.Bytes.from_hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"),
+  msg = string.char(0x72),
+  sig = Driver.Bytes.from_hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da" ..
+    "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+}
+
+local function flip_byte(s, i)
+  return s:sub(1, i - 1) .. string.char((s:byte(i) + 1) % 256) .. s:sub(i + 1)
+end
+
+-- Runs fn with the Ed25519 backend re-resolved against `openssl_module`
+-- (nil = whatever require finds), restoring it and the key cache afterwards.
+local function with_ed25519_backend(openssl_module, fn)
+  local O = Driver.OpenSSLCrypto
+  local saved_native, saved_module, saved_cache = O._ed25519_native, package.loaded.openssl, O.ed25519_private_key_cache
+  if openssl_module ~= nil then package.loaded.openssl = openssl_module end
+  O._ed25519_native, O.ed25519_private_key_cache = nil, {}
+  local ok, err = pcall(fn, O)
+  O._ed25519_native, package.loaded.openssl, O.ed25519_private_key_cache = saved_native, saved_module, saved_cache
+  if not ok then error(err, 0) end
+end
+
+-- lua-openssl lookalike that knows RFC 8032 tests 1 and 2 by their DER keys.
+local function ed25519_stub_openssl(calls)
+  local B = Driver.Bytes
+  local pkcs8, spki = B.from_hex("302e020100300506032b657004220420"), B.from_hex("302a300506032b6570032100")
+  local vectors = {
+    { seed = ED25519_VECTOR_SEED, pub = ED25519_VECTOR_PUBLIC, msg = "", sig = ED25519_VECTOR_SIGNATURE },
+    ED25519_TEST2,
+  }
+  return {
+    pkey = { read = function(der, private, format)
+      assert_eq(format, "der", "key format")
+      calls.read = calls.read + 1
+      for _, v in ipairs(vectors) do
+        if private and der == pkcs8 .. v.seed or not private and der == spki .. v.pub then return { v = v } end
+      end
+      return nil, "unknown key"
+    end },
+    digest = {
+      signInit = function(md, key)
+        assert_eq(md, nil, "sign digest")
+        return { sign = function(_, msg)
+          calls.sign = calls.sign + 1
+          return msg == key.v.msg and key.v.sig or string.rep("\0", 64)
+        end }
+      end,
+      verifyInit = function(md, key)
+        assert_eq(md, nil, "verify digest")
+        return { verify = function(_, sig, msg)
+          calls.verify = calls.verify + 1
+          if sig == key.v.sig and msg == key.v.msg then return true end
+        end }
+      end,
+    },
+  }
+end
+
+local function seed_ed25519_cache(O, v)
+  O.ed25519_private_key_cache[Driver.Bytes.hex(v.seed)] = { private_key = v.seed, public_key = v.pub, prefix = "" }
+end
+
+function tests.ed25519_native_backend_signs_and_verifies_through_der_keys()
+  local calls = { read = 0, sign = 0, verify = 0 }
+  local v = ED25519_TEST2
+  with_ed25519_backend(ed25519_stub_openssl(calls), function(O)
+    assert_eq(O.ed25519_backend(), "native", "stub adopted")
+    seed_ed25519_cache(O, v)
+    local reads, signs = calls.read, calls.sign
+    assert_eq(O._sign_ed25519(v.seed, v.msg, v.pub), v.sig, "native sign")
+    assert_eq(O.ed25519_sign(v.seed, v.msg), v.sig, "native sign again")
+    assert_eq(calls.sign - signs, 2, "signed natively")
+    assert_eq(calls.read - reads, 1, "private key imported once")
+    reads = calls.read
+    assert_eq(O._default_verify_ed25519(v.pub, v.sig, v.msg), true, "native verify")
+    assert_eq(O._default_verify_ed25519(v.pub, flip_byte(v.sig, 40), v.msg), false, "tampered signature")
+    assert_eq(O._default_verify_ed25519(v.pub, v.sig, v.msg .. "x"), false, "tampered message")
+    assert_eq(calls.read - reads, 1, "peer key imported once")
+  end)
+end
+
+function tests.ed25519_falls_back_to_lua_when_native_is_broken()
+  local E = Driver.Ed25519Pure
+  local calls = { read = 0, sign = 0, verify = 0 }
+  local function stub(patch)
+    local s = ed25519_stub_openssl(calls)
+    patch(s)
+    return s
+  end
+  local broken = {
+    {},
+    stub(function(s) s.pkey.read = function() error("not support ed25519!!!!") end end),
+    stub(function(s) s.digest.signInit = function() return { sign = function() return ED25519_TEST2.sig end } end end),
+    stub(function(s) s.digest.verifyInit = function() return { verify = function() return true end } end end),
+    stub(function(s) s.digest.verifyInit = function() return { verify = function() return 1 end } end end),
+  }
+  for i, module in ipairs(broken) do
+    with_ed25519_backend(module, function(O)
+      assert_eq(O.ed25519_backend(), "lua", "broken stub " .. i .. " rejected")
+    end)
+  end
+
+  local saved_sign, saved_verify = E.sign_expanded, E.verify
+  local lua_calls = 0
+  E.sign_expanded = function() lua_calls = lua_calls + 1; return "lua-sig" end
+  E.verify = function() lua_calls = lua_calls + 1; return "lua-verify" end
+  local fail = false
+  local flaky = stub(function(s)
+    local read = s.pkey.read
+    s.pkey.read = function(...) if fail then error("boom") end return read(...) end
+  end)
+  local ok, err = pcall(with_ed25519_backend, flaky, function(O)
+    assert_eq(O.ed25519_backend(), "native", "flaky stub adopted")
+    seed_ed25519_cache(O, ED25519_TEST2)
+    fail = true
+    assert_eq(O._sign_ed25519(ED25519_TEST2.seed, "m"), "lua-sig", "sign falls back")
+    assert_eq(O._default_verify_ed25519(ED25519_TEST2.pub, ED25519_TEST2.sig, "m"), "lua-verify", "verify falls back")
+    assert_eq(lua_calls, 2, "Lua path used")
+  end)
+  E.sign_expanded, E.verify = saved_sign, saved_verify
+  if not ok then error(err, 0) end
+end
+
+function tests.ed25519_real_openssl_backend_is_native()
+  local B, E = Driver.Bytes, Driver.Ed25519Pure
+  with_ed25519_backend(nil, function(O)
+    assert(O.ed25519_backend() == "native", "requires lua-openssl Ed25519")
+    local long = {
+      seed = B.from_hex("ec63885291d3f630cb1b5517c5cf941c7ea2e796399acf45dedde0323b983935"),
+      pub = B.from_hex("c51904be720a71e102a330bd9b91f8a9acea5b5d54495686ffa7e55a4030a134"),
+      msg = string.rep("Apple TV pair-verify ", 20),
+      sig = B.from_hex("a3c62b20387f01d271f29d4fa05269e2569e7973aab53dd6425354ed16be8904" ..
+        "232ed89c7d968a854aaddb348a0267953ebdeadcb6a89134ab7eafb4b53f3b04"),
+    }
+    local cases = {
+      { seed = ED25519_VECTOR_SEED, pub = ED25519_VECTOR_PUBLIC, msg = "", sig = ED25519_VECTOR_SIGNATURE },
+      ED25519_TEST2, long,
+    }
+    for n, v in ipairs(cases) do
+      local label = "case " .. n .. ": "
+      assert_eq(B.hex(O._sign_ed25519(v.seed, v.msg, v.pub)), B.hex(v.sig), label .. "sign")
+      assert_eq(O._sign_ed25519(v.seed, v.msg), E.sign(v.seed, v.pub, v.msg), label .. "matches Lua")
+      assert_eq(O._default_verify_ed25519(v.pub, v.sig, v.msg), true, label .. "verify")
+      assert_eq(O._default_verify_ed25519(v.pub, flip_byte(v.sig, 1), v.msg), false, label .. "tampered R")
+      assert_eq(O._default_verify_ed25519(v.pub, flip_byte(v.sig, 40), v.msg), false, label .. "tampered S")
+      assert_eq(O._default_verify_ed25519(v.pub, v.sig, v.msg .. "x"), false, label .. "wrong message")
+      assert_eq(O._default_verify_ed25519(cases[n % 3 + 1].pub, v.sig, v.msg), false, label .. "wrong key")
+      assert_eq(O._default_verify_ed25519(v.pub, v.sig:sub(1, 63), v.msg), false, label .. "short signature")
+    end
+  end)
+end
+
 function tests.crypto_random_bytes_requires_provider()
   local old = Driver.Crypto.provider
   Driver.Crypto.provider = nil

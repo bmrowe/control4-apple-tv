@@ -2202,6 +2202,60 @@ function OpenSSLCrypto._derive_x25519(private_key, server_public_key)
   return X25519Pure.mul(private_key, server_public_key)
 end
 
+-- lua-openssl 0.8.5 refuses pkey.new("ed25519") but imports RFC 8410 DER keys
+-- and signs via EVP_DigestSign with no digest. Adopted only if it reproduces
+-- RFC 8032 test 1 and rejects a tampered signature and message.
+local function _resolve_native_ed25519()
+  local ok, openssl = pcall(require, "openssl")
+  if not ok or type(openssl) ~= "table" then return false end
+  local pkey, digest = openssl.pkey, openssl.digest
+  if type(pkey) ~= "table" or type(digest) ~= "table" then return false end
+  local read, sign_init, verify_init = pkey.read, digest.signInit, digest.verifyInit
+  if type(read) ~= "function" or type(sign_init) ~= "function" or type(verify_init) ~= "function" then
+    return false
+  end
+  local pkcs8 = Bytes.from_hex("302e020100300506032b657004220420")
+  local spki = Bytes.from_hex("302a300506032b6570032100")
+  local native = { private_keys = setmetatable({}, { __mode = "k" }) }
+  function native.sign(expanded, message)
+    local key = native.private_keys[expanded]
+    if not key then
+      key = assert(read(pkcs8 .. expanded.private_key, true, "der"))
+      native.private_keys[expanded] = key
+    end
+    local signature = sign_init(nil, key):sign(message)
+    assert(type(signature) == "string" and #signature == 64, "native Ed25519 signature invalid")
+    return signature
+  end
+  function native.verify(public_key, signature, message)
+    if native.peer ~= public_key then
+      native.peer_key = assert(read(spki .. public_key, false, "der"))
+      native.peer = public_key
+    end
+    return verify_init(nil, native.peer_key):verify(signature, message) == true
+  end
+  local seed = Bytes.from_hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+  local public_key = Bytes.from_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+  local signature = Bytes.from_hex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" ..
+    "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+  local tampered = signature:sub(1, 63) .. string.char((signature:byte(64) + 1) % 256)
+  local ran, passed = pcall(function()
+    return native.sign({ private_key = seed }, "") == signature
+      and native.verify(public_key, signature, "")
+      and not native.verify(public_key, tampered, "")
+      and not native.verify(public_key, signature, "x")
+  end)
+  if ran and passed == true then return native end
+  return false
+end
+
+function OpenSSLCrypto.ed25519_backend()
+  if OpenSSLCrypto._ed25519_native == nil then
+    OpenSSLCrypto._ed25519_native = _resolve_native_ed25519()
+  end
+  return OpenSSLCrypto._ed25519_native and "native" or "lua"
+end
+
 function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
   local expanded = OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
   -- Ed25519 binds A into k = H(R || A || M), so a public key disagreeing with
@@ -2209,6 +2263,10 @@ function OpenSSLCrypto._sign_ed25519(private_key_bytes, data, public_key)
   -- an alternate key.
   assert(not public_key or public_key == expanded.public_key,
     "Ed25519 public key does not match private key")
+  if OpenSSLCrypto.ed25519_backend() == "native" then
+    local ok, signature = pcall(OpenSSLCrypto._ed25519_native.sign, expanded, data)
+    if ok then return signature end
+  end
   return Ed25519Pure.sign_expanded(expanded, data)
 end
 
@@ -2224,6 +2282,10 @@ function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
 end
 
 function OpenSSLCrypto._default_verify_ed25519(public_key_bytes, signature, data)
+  if OpenSSLCrypto.ed25519_backend() == "native" then
+    local ok, valid = pcall(OpenSSLCrypto._ed25519_native.verify, public_key_bytes, signature, data)
+    if ok then return valid end
+  end
   return Ed25519Pure.verify(public_key_bytes, signature, data)
 end
 
@@ -8197,7 +8259,8 @@ end
 function C4Driver.init()
   Log.output("Lua runtime: " .. tostring(_VERSION) .. ", jit=" ..
     (jit and (tostring(jit.version) .. " " .. ((jit.status()) and "on" or "off")) or "none") ..
-    ", chacha20=" .. ChaCha20Poly1305Pure.keystream_backend())
+    ", chacha20=" .. ChaCha20Poly1305Pure.keystream_backend() ..
+    ", ed25519=" .. OpenSSLCrypto.ed25519_backend())
   Driver.state = Storage.load()
   DEBUGPRINT = Properties and Properties["Debug Mode"] == "On"
   Companion.app_list = Driver.state.app_list or {}
