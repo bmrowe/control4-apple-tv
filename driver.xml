@@ -504,7 +504,7 @@
     </connections>
     <config>
         <documentation file="www/documentation.rtf" />
-        <script jit="1" file="driver.lua" />
+        <script file="driver.lua" />
         <properties>
             <!--
               Composer renders these in declaration order and DriverWorks has no

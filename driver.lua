@@ -76,61 +76,6 @@ function Log.output(message)
   end
 end
 
--- LuaJIT on the Core 5 can lose the ability to allocate machine code (ARM64
--- traces must sit near libluajit, and that space fills over Director uptime).
--- It then records, fails and flushes on every hot loop, measured ~300x slower
--- than the interpreter, so fall back to the interpreter once that shows up.
-local JitGuard = { starts = 0, traces = 0, mcode_failures = 0 }
-
-function JitGuard.jit_on()
-  return type(jit) == "table" and type(jit.status) == "function" and (jit.status()) == true
-end
-
-function JitGuard.on_trace(what, _, _, _, code)
-  if what == "start" then
-    JitGuard.starts = JitGuard.starts + 1
-  elseif what == "stop" then
-    JitGuard.traces = JitGuard.traces + 1
-  elseif what == "abort" then
-    local reason = JitGuard.traceerr and JitGuard.traceerr[code]
-    if type(reason) == "string" and reason:find("mcode", 1, true) then
-      JitGuard.mcode_failures = JitGuard.mcode_failures + 1
-    end
-  end
-end
-
--- Counts reset per check, so a JIT that breaks later in Director's uptime is
--- caught too. Without jit.vmdef, many starts and no finished trace also count.
-function JitGuard.check(context, min_starts)
-  if not JitGuard.started or not JitGuard.jit_on() then return false end
-  local starts, traces, failures = JitGuard.starts, JitGuard.traces, JitGuard.mcode_failures
-  JitGuard.starts, JitGuard.traces, JitGuard.mcode_failures = 0, 0, 0
-  if failures == 0 and (starts < (min_starts or 50) or traces > 0) then return false end
-  pcall(jit.attach, JitGuard.on_trace)
-  pcall(jit.flush)
-  jit.off()
-  JitGuard.disabled = string.format("%s: %d mcode allocation failures, %d of %d traces finished",
-    tostring(context), failures, traces, starts)
-  Log.output("LuaJIT cannot allocate machine code here; running interpreted (" .. JitGuard.disabled .. ")")
-  return true
-end
-
-function JitGuard.start()
-  if JitGuard.started or not JitGuard.jit_on() or type(jit.attach) ~= "function" then return end
-  local ok, vmdef = pcall(require, "jit.vmdef")
-  JitGuard.traceerr = ok and type(vmdef) == "table" and vmdef.traceerr or nil
-  if not pcall(jit.attach, JitGuard.on_trace, "trace") then return end
-  JitGuard.started = true
-  -- hot enough that a working JIT finishes at least one trace
-  local function spin()
-    local s = 0
-    for i = 1, 500 do s = s + i % 3 end
-    return s
-  end
-  for _ = 1, 4 do spin() end
-  JitGuard.check("startup probe", 1)
-end
-
 -- Refusal is normal for a sleeping Apple TV, so report once per episode. The
 -- counter lives on `owner`, which outlives the per-session state.
 local Refused = {}
@@ -1250,9 +1195,7 @@ do
   -- Director always provides a bit module; there is deliberately no pure-Lua
   -- substitute. The one we used to fall back on ran ChaCha20 ~30-47x slower
   -- while logging nothing, and refusing to load is easier to diagnose.
-  -- Under LuaJIT prefer its built-in bit, which the compiler inlines; calls
-  -- into a C bit32 module would abort every trace.
-  local ops = (jit and bit) or bit32 or bit
+  local ops = bit32 or bit
   assert(ops, "Apple TV driver requires a native bit library (bit32 or bit); " ..
     "Director normally provides one. ChaCha20 cannot run without it.")
   Bit32.band = ops.band
@@ -1281,7 +1224,7 @@ local function _le32_words(s, n)
 end
 
 -- One ChaCha20 block into ks[0..15] as unsigned words. State lives in locals,
--- not tables: ~4x faster interpreted, ~3.5x under LuaJIT.
+-- not tables: ~4x faster interpreted.
 local function _chacha_block(ks, k, ctr, nw)
   local M = _U32
   local s0, s1, s2, s3 = 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574
@@ -1697,7 +1640,7 @@ local function _le_bit(bytes, t)
 end
 
 -- ===== X25519 (Montgomery ladder, RFC 7748) =====
-function X25519Pure.mul_bn(k_bytes, u_bytes)
+function X25519Pure.mul(k_bytes, u_bytes)
   _ensure_curve()
   local ub = { u_bytes:byte(1, 32) }
   ub[32] = ub[32] % 128
@@ -1742,122 +1685,6 @@ end
 -- Base point u=9 in little-endian
 X25519Pure.BASE_POINT = string.char(9) .. string.rep("\0", 31)
 
--- TweetNaCl-style 16 x 16-bit limb ladder. Under LuaJIT this compiles to a
--- tight loop and beats the per-op bn calls; interpreted, bn is ~9x faster.
-do
-  local floor = math.floor
-  local PRIME = {
-    [0] = 0xffed, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0x7fff,
-  }
-  local A24 = { [0] = 0xdb41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
-
-  local function carry(o)
-    for i = 0, 15 do
-      o[i] = o[i] + 0x10000
-      local c = floor(o[i] / 0x10000)
-      if i < 15 then
-        o[i + 1] = o[i + 1] + c - 1
-      else
-        o[0] = o[0] + 38 * (c - 1)
-      end
-      o[i] = o[i] % 0x10000
-    end
-  end
-
-  local function swap(a, b, bit)
-    local inv = 1 - bit
-    for i = 0, 15 do
-      local ai, bi = a[i], b[i]
-      a[i] = ai * inv + bi * bit
-      b[i] = bi * inv + ai * bit
-    end
-  end
-
-  local function add(o, a, b) for i = 0, 15 do o[i] = a[i] + b[i] end end
-  local function sub(o, a, b) for i = 0, 15 do o[i] = a[i] - b[i] end end
-
-  local function mul(o, a, b, prod)
-    for i = 0, 31 do prod[i] = 0 end
-    for i = 0, 15 do
-      local ai = a[i]
-      for j = 0, 15 do prod[i + j] = prod[i + j] + ai * b[j] end
-    end
-    for i = 0, 14 do prod[i] = prod[i] + 38 * prod[i + 16] end
-    for i = 0, 15 do o[i] = prod[i] end
-    carry(o); carry(o)
-  end
-
-  -- a^(p-2) via the standard 2^255-21 addition chain
-  local function inv(o, a, prod)
-    local t, x2, x9, x11, x5, x10, x20, x50, x100 = {}, {}, {}, {}, {}, {}, {}, {}, {}
-    local function sqn(dst, src, n)
-      mul(dst, src, src, prod)
-      for _ = 2, n do mul(dst, dst, dst, prod) end
-    end
-    mul(x2, a, a, prod)
-    sqn(t, x2, 2); mul(x9, t, a, prod)
-    mul(x11, x9, x2, prod)
-    mul(t, x11, x11, prod); mul(x5, t, x9, prod)
-    sqn(t, x5, 5); mul(x10, t, x5, prod)
-    sqn(t, x10, 10); mul(x20, t, x10, prod)
-    sqn(t, x20, 20); mul(t, t, x20, prod)
-    sqn(t, t, 10); mul(x50, t, x10, prod)
-    sqn(t, x50, 50); mul(x100, t, x50, prod)
-    sqn(t, x100, 100); mul(t, t, x100, prod)
-    sqn(t, t, 50); mul(t, t, x50, prod)
-    sqn(t, t, 5); mul(o, t, x11, prod)
-  end
-
-  local function pack(a)
-    local t, m, out = {}, {}, {}
-    for i = 0, 15 do t[i] = a[i] end
-    carry(t); carry(t); carry(t)
-    for _ = 0, 1 do
-      m[0] = t[0] - PRIME[0]
-      for i = 1, 15 do
-        m[i] = t[i] - PRIME[i] - (floor(m[i - 1] / 0x10000) % 2)
-        m[i - 1] = m[i - 1] % 0x10000
-      end
-      swap(t, m, 1 - floor(m[15] / 0x10000) % 2)
-    end
-    for i = 0, 15 do
-      out[2 * i + 1] = string.char(t[i] % 0x100)
-      out[2 * i + 2] = string.char(floor(t[i] / 0x100))
-    end
-    return table.concat(out)
-  end
-
-  function X25519Pure.mul_lua(k_bytes, u_bytes)
-    local x, a, b, c, d, e, f, prod = {}, {}, {}, {}, {}, {}, {}, {}
-    local ub, kb = { u_bytes:byte(1, 32) }, { k_bytes:byte(1, 32) }
-    for i = 0, 15 do x[i] = ub[2 * i + 1] + ub[2 * i + 2] * 0x100 end
-    x[15] = x[15] % 0x8000
-    kb[1] = kb[1] - kb[1] % 8
-    kb[32] = kb[32] % 64 + 64
-    for i = 0, 15 do a[i], b[i], c[i], d[i] = 0, x[i], 0, 0 end
-    a[0], d[0] = 1, 1
-    for i = 254, 0, -1 do
-      local bit = floor(kb[floor(i / 8) + 1] / 2 ^ (i % 8)) % 2
-      swap(a, b, bit); swap(c, d, bit)
-      add(e, a, c); sub(a, a, c); add(c, b, d); sub(b, b, d)
-      mul(d, e, e, prod); mul(f, a, a, prod); mul(a, c, a, prod); mul(c, b, e, prod)
-      add(e, a, c); sub(a, a, c); mul(b, a, a, prod); sub(c, d, f)
-      mul(a, c, A24, prod); add(a, a, d); mul(c, c, a, prod); mul(a, d, f, prod)
-      mul(d, b, x, prod); mul(b, e, e, prod)
-      swap(a, b, bit); swap(c, d, bit)
-    end
-    inv(c, c, prod)
-    mul(a, a, c, prod)
-    return pack(a)
-  end
-end
-
--- Chosen per call: JitGuard may turn the JIT off after load.
-function X25519Pure.mul(k_bytes, u_bytes)
-  if JitGuard.jit_on() then return X25519Pure.mul_lua(k_bytes, u_bytes) end
-  return X25519Pure.mul_bn(k_bytes, u_bytes)
-end
 local Ed25519Pure = {}
 
 local function _sha512_bytes(data)
@@ -8258,7 +8085,6 @@ function C4Driver.companion_watchdog_teardown(client, reason)
 end
 
 function C4Driver.check_companion_watchdog()
-  JitGuard.check("watchdog")
   local client = Companion.client
   if not client then return end
   if client.cleanup_pending_responses then
@@ -8363,7 +8189,6 @@ function C4Driver.build_companion_client(host, options)
 end
 
 function C4Driver.connect_companion()
-  JitGuard.check("connect")
   C4Driver.ensure_crypto_provider()
   local host = Properties and Properties["Apple TV Address"]
   local credentials = Companion.credentials or C4Driver.load_persisted_credentials()
@@ -8557,9 +8382,7 @@ for name, entry in pairs(C4Driver.remote_buttons) do
 end
 
 function C4Driver.init()
-  JitGuard.start()
-  Log.output("Lua runtime: " .. tostring(_VERSION) .. ", jit=" ..
-    (jit and (tostring(jit.version) .. " " .. ((jit.status()) and "on" or "off")) or "none") ..
+  Log.output("Lua runtime: " .. tostring(_VERSION) ..
     ", chacha20=" .. ChaCha20Poly1305Pure.keystream_backend() ..
     ", ed25519=" .. OpenSSLCrypto.ed25519_backend() ..
     ", x25519=" .. OpenSSLCrypto.x25519_backend())
@@ -8702,6 +8525,5 @@ Driver.Storage = Storage
 Driver.Credentials = Credentials
 Driver.C4MiniApps = C4MiniApps
 Driver.C4Driver = C4Driver
-Driver.JitGuard = JitGuard
 
 return Driver

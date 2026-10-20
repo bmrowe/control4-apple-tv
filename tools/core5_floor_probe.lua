@@ -1,6 +1,5 @@
 -- Paste into the Apple TV driver's Lua tab in Composer. Blocks the driver ~2 s.
--- Reports whether LuaJIT is actually compiling on the controller and where the
--- per-frame AEAD floor goes.
+-- Reports where the per-frame AEAD floor goes.
 local function upvalue(fn, want)
   for i = 1, 255 do
     local name, value = debug.getupvalue(fn, i)
@@ -23,34 +22,9 @@ end
 
 local hook, mask, count = debug.gethook()
 print("debug hook: " .. tostring(hook) .. " mask=" .. tostring(mask) .. " count=" .. tostring(count))
-print("jit: " .. tostring(jit and jit.version) .. " status=" .. tostring(jit and (jit.status())))
-
--- JIT health: a tight pure-Lua loop, then trace events while AEAD runs
-bench("pure Lua loop, 10k iterations", function()
-  local s = 0
-  for i = 1, 10000 do s = s + i % 7 end
-  return s
-end)
 local key, nonce, aad = O.random_bytes(32), O.random_bytes(12), "aad!"
 local pt1k = string.rep("p", 1024)
 local ct1k = C.encrypt(key, nonce, pt1k, aad)
-local events, reasons = { start = 0, stop = 0, abort = 0 }, {}
-local vmdef_ok, vmdef = pcall(require, "jit.vmdef")
-local attached = jit and jit.attach and pcall(jit.attach, function(what, _, _, _, otr, oex)
-  events[what] = (events[what] or 0) + 1
-  if what == "abort" then
-    local reason = tostring(otr)
-    if vmdef_ok and type(otr) == "number" and vmdef.traceerr and vmdef.traceerr[otr] then
-      reason = string.format(vmdef.traceerr[otr], tostring(oex))
-    end
-    reasons[reason] = (reasons[reason] or 0) + 1
-  end
-end, "trace")
-for _ = 1, 300 do C.decrypt(key, nonce, ct1k, aad); C.encrypt(key, nonce, pt1k, aad) end
-if attached then pcall(jit.attach, function() end) end
-print(string.format("trace events during 600 AEAD calls: start=%d stop=%d abort=%d (attach %s)",
-  events.start or 0, events.stop or 0, events.abort or 0, attached and "ok" or "unavailable"))
-for reason, n in pairs(reasons) do print("  abort x" .. n .. ": " .. reason) end
 
 -- per-frame pieces
 local zeros = string.rep("\0", 32)
