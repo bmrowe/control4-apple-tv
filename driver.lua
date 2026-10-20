@@ -1419,8 +1419,9 @@ local _OTK_ZEROS = string.rep("\0", 32)
 -- Poly1305 is linear in its blocks, so the AAD-less native AEAD can MAC our
 -- (aad, ct): swap the last two data blocks a, b for x, y with
 -- x*r + y == a*r + b + (L - L')/r (mod 2^130-5), L' being the (0, |C|) length
--- block native appends. Fixed cost ~20 us, so only large frames use it.
-ChaCha20Poly1305Pure.NATIVE_TAG_MIN_BYTES = 3072
+-- block native appends. On the Core 5 it beats Lua Poly1305 at every size
+-- (~0.7 ms flat vs ~0.6 ms + 3.8 us/byte); one-block messages stay in Lua.
+ChaCha20Poly1305Pure.NATIVE_TAG_MIN_BYTES = 0
 
 local function _resolve_native_tag()
   if ChaCha20Poly1305Pure.keystream_backend() ~= "native" then return false end
