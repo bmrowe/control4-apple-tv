@@ -5567,6 +5567,125 @@ function tests.ed25519_key_expansion_takes_the_public_key_from_native()
   end)
 end
 
+local function with_fake_jit(fn)
+  local G = Driver.JitGuard
+  local saved_jit = jit
+  local keys = { "started", "starts", "traces", "mcode_failures", "traceerr", "disabled" }
+  local saved = {}
+  for _, k in ipairs(keys) do saved[k] = G[k] end
+  local fake = { version = "fake", on = true, offs = 0, flushes = 0, attached = 0, detached = 0 }
+  fake.status = function() return fake.on end
+  fake.off = function() fake.on = false; fake.offs = fake.offs + 1 end
+  fake.flush = function() fake.flushes = fake.flushes + 1 end
+  fake.attach = function(_, what)
+    if what then fake.attached = fake.attached + 1 else fake.detached = fake.detached + 1 end
+  end
+  jit = fake
+  G.started, G.starts, G.traces, G.mcode_failures, G.traceerr, G.disabled = false, 0, 0, 0, nil, nil
+  local ok, err = pcall(fn, G, fake)
+  jit = saved_jit
+  for _, k in ipairs(keys) do G[k] = saved[k] end
+  if not ok then error(err, 0) end
+end
+
+local function with_ladder_markers(fn)
+  local X = Driver.X25519Pure
+  local lua_mul, bn_mul = X.mul_lua, X.mul_bn
+  X.mul_lua, X.mul_bn = function() return "lua" end, function() return "bn" end
+  local ok, err = pcall(fn, X)
+  X.mul_lua, X.mul_bn = lua_mul, bn_mul
+  if not ok then error(err, 0) end
+end
+
+function tests.jit_guard_keeps_a_jit_that_finishes_traces()
+  with_fake_jit(function(G, fake)
+    G.start()
+    assert_eq(fake.attached, 1, "trace handler attached")
+    G.traceerr = { [3] = "leaving loop in root trace" }
+    for _ = 1, 100 do
+      G.on_trace("start"); G.on_trace("abort", nil, nil, nil, 3); G.on_trace("start"); G.on_trace("stop")
+    end
+    assert_eq(G.check("watchdog"), false, "ordinary aborts are not a failure")
+    assert_eq(fake.on, true, "jit left on")
+    assert_eq(fake.offs, 0, "never turned off")
+    with_ladder_markers(function(X)
+      assert_eq(X.mul("k", "u"), "lua", "lua ladder while the jit works")
+    end)
+  end)
+end
+
+function tests.jit_guard_falls_back_to_the_interpreter_on_mcode_failures()
+  with_fake_jit(function(G, fake)
+    G.start()
+    G.traceerr = { [7] = "failed to allocate mcode memory" }
+    G.on_trace("start"); G.on_trace("abort", nil, nil, nil, 7)
+    assert_eq(G.check("watchdog"), true, "tripped")
+    assert_eq(fake.on, false, "jit off")
+    assert_eq(fake.offs, 1, "turned off once")
+    assert_eq(fake.flushes, 1, "traces flushed")
+    assert_eq(fake.detached, 1, "handler detached")
+    assert(G.disabled:find("watchdog: 1 mcode allocation failures", 1, true), "reason recorded: " .. tostring(G.disabled))
+    assert_eq(G.check("watchdog"), false, "nothing more to do once off")
+    assert_eq(fake.offs, 1, "still turned off once")
+    with_ladder_markers(function(X)
+      assert_eq(X.mul("k", "u"), "bn", "bn ladder once interpreted")
+    end)
+  end)
+end
+
+function tests.jit_guard_without_vmdef_trips_on_starts_that_never_finish()
+  with_fake_jit(function(G, fake)
+    G.start()
+    G.traceerr = nil
+    for _ = 1, 49 do G.on_trace("start"); G.on_trace("abort", nil, nil, nil, 7) end
+    assert_eq(G.check("watchdog"), false, "49 starts is below the bar")
+    for _ = 1, 50 do G.on_trace("start"); G.on_trace("abort", nil, nil, nil, 7) end
+    assert_eq(G.check("watchdog"), true, "50 starts and no trace")
+    assert_eq(fake.on, false, "jit off")
+  end)
+  with_fake_jit(function(G, fake)
+    G.start()
+    G.on_trace("start")
+    assert_eq(G.check("startup probe", 1), true, "the startup probe must finish a trace")
+    assert_eq(fake.on, false, "jit off")
+  end)
+end
+
+function tests.jit_guard_is_inert_without_luajit()
+  with_fake_jit(function(G)
+    jit = nil
+    G.start()
+    assert_eq(G.started, false, "not started")
+    assert_eq(G.check("watchdog"), false, "no check")
+    with_ladder_markers(function(X)
+      assert_eq(X.mul("k", "u"), "bn", "bn ladder without LuaJIT")
+    end)
+  end)
+end
+
+function tests.jit_guard_keeps_a_working_real_jit()
+  local G = Driver.JitGuard
+  if type(jit) ~= "table" then
+    G.start()
+    assert(not G.started, "no-op without LuaJIT")
+    return
+  end
+  local was_on = (jit.status())
+  local saved_started = G.started
+  G.started, G.starts, G.traces, G.mcode_failures, G.disabled = false, 0, 0, 0, nil
+  local ok, err = pcall(function()
+    G.start()
+    if was_on then
+      assert_eq((jit.status()), true, "healthy jit stays on")
+      assert_eq(G.disabled, nil, "no fallback recorded")
+    end
+  end)
+  pcall(jit.attach, G.on_trace)
+  G.started = saved_started
+  if was_on and not (jit.status()) then jit.on() end
+  if not ok then error(err, 0) end
+end
+
 function tests.openssl_random_bytes_reuses_one_urandom_handle()
   local O = Driver.OpenSSLCrypto
   local saved_openssl, saved_handle = O.openssl, O._urandom

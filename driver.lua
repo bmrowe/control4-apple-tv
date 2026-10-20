@@ -76,6 +76,61 @@ function Log.output(message)
   end
 end
 
+-- LuaJIT on the Core 5 can lose the ability to allocate machine code (ARM64
+-- traces must sit near libluajit, and that space fills over Director uptime).
+-- It then records, fails and flushes on every hot loop, measured ~300x slower
+-- than the interpreter, so fall back to the interpreter once that shows up.
+local JitGuard = { starts = 0, traces = 0, mcode_failures = 0 }
+
+function JitGuard.jit_on()
+  return type(jit) == "table" and type(jit.status) == "function" and (jit.status()) == true
+end
+
+function JitGuard.on_trace(what, _, _, _, code)
+  if what == "start" then
+    JitGuard.starts = JitGuard.starts + 1
+  elseif what == "stop" then
+    JitGuard.traces = JitGuard.traces + 1
+  elseif what == "abort" then
+    local reason = JitGuard.traceerr and JitGuard.traceerr[code]
+    if type(reason) == "string" and reason:find("mcode", 1, true) then
+      JitGuard.mcode_failures = JitGuard.mcode_failures + 1
+    end
+  end
+end
+
+-- Counts reset per check, so a JIT that breaks later in Director's uptime is
+-- caught too. Without jit.vmdef, many starts and no finished trace also count.
+function JitGuard.check(context, min_starts)
+  if not JitGuard.started or not JitGuard.jit_on() then return false end
+  local starts, traces, failures = JitGuard.starts, JitGuard.traces, JitGuard.mcode_failures
+  JitGuard.starts, JitGuard.traces, JitGuard.mcode_failures = 0, 0, 0
+  if failures == 0 and (starts < (min_starts or 50) or traces > 0) then return false end
+  pcall(jit.attach, JitGuard.on_trace)
+  pcall(jit.flush)
+  jit.off()
+  JitGuard.disabled = string.format("%s: %d mcode allocation failures, %d of %d traces finished",
+    tostring(context), failures, traces, starts)
+  Log.output("LuaJIT cannot allocate machine code here; running interpreted (" .. JitGuard.disabled .. ")")
+  return true
+end
+
+function JitGuard.start()
+  if JitGuard.started or not JitGuard.jit_on() or type(jit.attach) ~= "function" then return end
+  local ok, vmdef = pcall(require, "jit.vmdef")
+  JitGuard.traceerr = ok and type(vmdef) == "table" and vmdef.traceerr or nil
+  if not pcall(jit.attach, JitGuard.on_trace, "trace") then return end
+  JitGuard.started = true
+  -- hot enough that a working JIT finishes at least one trace
+  local function spin()
+    local s = 0
+    for i = 1, 500 do s = s + i % 3 end
+    return s
+  end
+  for _ = 1, 4 do spin() end
+  JitGuard.check("startup probe", 1)
+end
+
 -- Refusal is normal for a sleeping Apple TV, so report once per episode. The
 -- counter lives on `owner`, which outlives the per-session state.
 local Refused = {}
@@ -1798,8 +1853,11 @@ do
   end
 end
 
-X25519Pure.mul = (type(jit) == "table" and jit.status and jit.status())
-  and X25519Pure.mul_lua or X25519Pure.mul_bn
+-- Chosen per call: JitGuard may turn the JIT off after load.
+function X25519Pure.mul(k_bytes, u_bytes)
+  if JitGuard.jit_on() then return X25519Pure.mul_lua(k_bytes, u_bytes) end
+  return X25519Pure.mul_bn(k_bytes, u_bytes)
+end
 local Ed25519Pure = {}
 
 local function _sha512_bytes(data)
@@ -8200,6 +8258,7 @@ function C4Driver.companion_watchdog_teardown(client, reason)
 end
 
 function C4Driver.check_companion_watchdog()
+  JitGuard.check("watchdog")
   local client = Companion.client
   if not client then return end
   if client.cleanup_pending_responses then
@@ -8304,6 +8363,7 @@ function C4Driver.build_companion_client(host, options)
 end
 
 function C4Driver.connect_companion()
+  JitGuard.check("connect")
   C4Driver.ensure_crypto_provider()
   local host = Properties and Properties["Apple TV Address"]
   local credentials = Companion.credentials or C4Driver.load_persisted_credentials()
@@ -8497,6 +8557,7 @@ for name, entry in pairs(C4Driver.remote_buttons) do
 end
 
 function C4Driver.init()
+  JitGuard.start()
   Log.output("Lua runtime: " .. tostring(_VERSION) .. ", jit=" ..
     (jit and (tostring(jit.version) .. " " .. ((jit.status()) and "on" or "off")) or "none") ..
     ", chacha20=" .. ChaCha20Poly1305Pure.keystream_backend() ..
@@ -8641,5 +8702,6 @@ Driver.Storage = Storage
 Driver.Credentials = Credentials
 Driver.C4MiniApps = C4MiniApps
 Driver.C4Driver = C4Driver
+Driver.JitGuard = JitGuard
 
 return Driver
