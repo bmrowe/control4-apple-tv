@@ -5088,11 +5088,13 @@ local RFC8439_CHACHA20 = {
 -- (nil = whatever require finds), restoring both afterwards.
 local function with_chacha_backend(openssl_module, fn)
   local C = Driver.ChaCha20Poly1305Pure
-  local saved_native, saved_module = C._native, package.loaded.openssl
+  local saved_native, saved_tag, saved_min = C._native, C._tag, C.NATIVE_TAG_MIN_BYTES
+  local saved_module = package.loaded.openssl
   if openssl_module ~= nil then package.loaded.openssl = openssl_module end
-  C._native = nil
+  C._native, C._tag = nil, nil
   local ok, err = pcall(fn, C)
-  C._native, package.loaded.openssl = saved_native, saved_module
+  C._native, C._tag, C.NATIVE_TAG_MIN_BYTES = saved_native, saved_tag, saved_min
+  package.loaded.openssl = saved_module
   if not ok then error(err, 0) end
 end
 
@@ -5166,6 +5168,84 @@ function tests.chacha20_real_openssl_keystream_is_native()
   with_chacha_backend(nil, function(C)
     assert(C.keystream_backend() == "native", "requires lua-openssl chacha20")
     assert_rfc8439_chacha20(C, "openssl")
+  end)
+end
+
+-- Every shape the forged native tag must reproduce: aad/ct around block
+-- boundaries, all-0xff blocks, and the lengths HAP and Companion actually use.
+local function aead_tag_cases()
+  local cases, seed = {}, 7
+  local function byte() seed = (seed * 1103515245 + 12345) % 2147483648; return seed % 256 end
+  local function blob(n, fill)
+    local t = {}
+    for i = 1, n do t[i] = string.char(fill or byte()) end
+    return table.concat(t)
+  end
+  for _, alen in ipairs({ 0, 2, 4, 12, 16, 17 }) do
+    for _, clen in ipairs({ 1, 15, 16, 17, 32, 33, 100, 1024, 2048, 4099 }) do
+      cases[#cases + 1] = { key = blob(32), nonce = blob(12), aad = blob(alen), ct = blob(clen) }
+      cases[#cases + 1] = { key = blob(32), nonce = blob(12), aad = blob(alen), ct = blob(clen, 255) }
+    end
+  end
+  return cases
+end
+
+function tests.chacha20_poly1305_native_tag_matches_lua_poly1305()
+  with_chacha_backend(nil, function(C)
+    assert(C.tag_backend() == "native", "requires lua-openssl chacha20-poly1305")
+    C.NATIVE_TAG_MIN_BYTES = 0
+    local forged = 0
+    for i, case in ipairs(aead_tag_cases()) do
+      local want = C.auth_tag(case.key, case.nonce, case.ct, case.aad)
+      local got = C._tag.tag(case.key, case.nonce, case.aad, case.ct)
+      if got ~= nil then
+        forged = forged + 1
+        assert_eq(Driver.Bytes.hex(got), Driver.Bytes.hex(want), "forged tag case " .. i)
+        assert_eq(C._tag.verify(case.key, case.nonce, case.aad, case.ct, want), true, "verify case " .. i)
+        assert_eq(C._tag.verify(case.key, case.nonce, case.aad, case.ct, want:reverse()), false,
+          "reject case " .. i)
+      end
+      local sealed = C.encrypt(case.key, case.nonce, case.ct, case.aad)
+      assert_eq(C.decrypt(case.key, case.nonce, sealed, case.aad), case.ct, "round trip case " .. i)
+      local tampered = sealed:sub(1, -2) .. string.char((sealed:byte(-1) + 1) % 256)
+      assert(not pcall(C.decrypt, case.key, case.nonce, tampered, case.aad), "tamper rejected case " .. i)
+    end
+    assert(forged >= 100, "forged path exercised: " .. forged)
+    tests.chacha20_poly1305_matches_rfc8439_aead_vector()
+  end)
+end
+
+function tests.chacha20_poly1305_native_tag_needs_openssl_bn_and_aead()
+  local stub = { cipher = { encrypt = function(_, data, key, iv)
+    return Driver.ChaCha20Poly1305Pure.chacha20_xor(key, iv:sub(5), 1, data)
+  end } }
+  with_chacha_backend(stub, function(C)
+    assert_eq(C.keystream_backend(), "native", "keystream stub adopted")
+    assert_eq(C.tag_backend(), "lua", "no bn/aead in stub")
+  end)
+  with_chacha_backend({}, function(C)
+    assert_eq(C.tag_backend(), "lua", "no openssl")
+  end)
+end
+
+function tests.chacha20_poly1305_survives_a_misbehaving_native_tag()
+  with_chacha_backend({}, function(C)
+    C.NATIVE_TAG_MIN_BYTES = 0
+    local reference = {}
+    for i, case in ipairs(aead_tag_cases()) do
+      reference[i] = C.encrypt(case.key, case.nonce, case.ct, case.aad)
+    end
+    C._tag = {
+      tag = function() return "short" end,
+      verify = function() return false end,
+    }
+    for i, case in ipairs(aead_tag_cases()) do
+      assert_eq(C.encrypt(case.key, case.nonce, case.ct, case.aad), reference[i], "bad tag ignored " .. i)
+      assert_eq(C.decrypt(case.key, case.nonce, reference[i], case.aad), case.ct, "false reject rechecked " .. i)
+    end
+    C._tag = { tag = function() error("boom") end, verify = function() error("boom") end }
+    local case = aead_tag_cases()[1]
+    assert_eq(C.decrypt(case.key, case.nonce, reference[1], case.aad), case.ct, "erroring native falls back")
   end)
 end
 

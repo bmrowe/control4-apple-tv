@@ -1416,13 +1416,104 @@ end
 
 local _OTK_ZEROS = string.rep("\0", 32)
 
+-- Poly1305 is linear in its blocks, so the AAD-less native AEAD can MAC our
+-- (aad, ct): swap the last two data blocks a, b for x, y with
+-- x*r + y == a*r + b + (L - L')/r (mod 2^130-5), L' being the (0, |C|) length
+-- block native appends. Fixed cost ~20 us, so only large frames use it.
+ChaCha20Poly1305Pure.NATIVE_TAG_MIN_BYTES = 3072
+
+local function _resolve_native_tag()
+  if ChaCha20Poly1305Pure.keystream_backend() ~= "native" then return false end
+  local ok, openssl = pcall(require, "openssl")
+  local bn = ok and type(openssl) == "table" and openssl.bn
+  local got_evp, evp = pcall(function() return openssl.cipher.get("chacha20-poly1305") end)
+  if type(bn) ~= "table" or not got_evp or not evp then return false end
+  local get_tag = openssl.cipher.EVP_CTRL_GCM_GET_TAG or 16
+  local set_tag = openssl.cipher.EVP_CTRL_GCM_SET_TAG or 17
+  local P = bn.text(Bytes.from_hex("03fffffffffffffffffffffffffffffffb"))
+  local T64, T128 = bn.text("\1" .. string.rep("\0", 8)), bn.text("\1" .. string.rep("\0", 16))
+  local T129 = bn.add(T128, T128)
+  local function le(s) return bn.text(s:reverse()) end
+  local function le16(v)
+    local be = bn.totext(v)
+    return (string.rep("\0", 16 - #be) .. be):reverse()
+  end
+
+  local function forge(key, nonce, aad, ct)
+    local data = aad .. _pad16(aad) .. ct .. _pad16(ct)
+    local k = #data / 16
+    if k < 2 then return nil end
+    local rb = { ChaCha20Poly1305Pure.chacha20(key, nonce, 0, _OTK_ZEROS):byte(1, 16) }
+    for i = 4, 16, 4 do rb[i] = rb[i] % 16 end
+    for i = 5, 13, 4 do rb[i] = rb[i] - rb[i] % 4 end
+    for i = 1, 16 do rb[i] = _char(rb[i]) end
+    local r = le(table.concat(rb))
+    if bn.compare(r, bn.number(8)) < 0 then return nil end
+    local a = bn.add(le(data:sub(16 * k - 31, 16 * k - 16)), T128)
+    local b = bn.add(le(data:sub(16 * k - 15)), T128)
+    local e = bn.mod(bn.add(P, bn.sub(bn.number(#aad), bn.mul(bn.number(16 * k - #ct), T64))), P)
+    local K = bn.addmod(bn.mulmod(a, r, P), bn.addmod(b, bn.mulmod(e, bn.invmod(r, P), P), P), P)
+    -- lift K to the smallest T = K + m*P >= 2^128*(r+1); then y lands in [2^128, 2^128+r)
+    local lo = bn.mul(T128, bn.add(r, bn.number(1)))
+    local T = bn.add(K, bn.mul(bn.div(bn.add(bn.sub(lo, K), bn.sub(P, bn.number(1))), P), P))
+    local x = bn.div(bn.sub(T, T128), r)
+    local y = bn.sub(T, bn.mul(x, r))
+    if bn.compare(x, T129) >= 0 or bn.compare(y, T128) < 0 or bn.compare(y, T129) >= 0 then return nil end
+    return data:sub(1, 16 * k - 32) .. le16(bn.sub(x, T128)) .. le16(bn.sub(y, T128))
+  end
+
+  local native = {}
+  function native.tag(key, nonce, aad, ct)
+    local forged = forge(key, nonce, aad, ct)
+    if not forged then return nil end
+    local ctx = evp:encrypt_new()
+    ctx:init(key, nonce)
+    ctx:update(ChaCha20Poly1305Pure.chacha20(key, nonce, 1, forged))
+    ctx:final()
+    return ctx:ctrl(get_tag, 16)
+  end
+  function native.verify(key, nonce, aad, ct, tag)
+    local forged = forge(key, nonce, aad, ct)
+    if not forged then return nil end
+    local ctx = evp:decrypt_new()
+    ctx:init(key, nonce)
+    ctx:ctrl(set_tag, tag)
+    ctx:update(forged)
+    return ctx:final() ~= nil
+  end
+
+  local key = Bytes.from_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+  local nonce = Bytes.from_hex("070000004041424344454647")
+  local aad, ct = "\0\1\2\3", string.rep("\171", 40)
+  local want = ChaCha20Poly1305Pure.auth_tag(key, nonce, ct, aad)
+  local ran, tag, good, bad = pcall(function()
+    return native.tag(key, nonce, aad, ct), native.verify(key, nonce, aad, ct, want),
+      native.verify(key, nonce, aad, ct, want:reverse())
+  end)
+  if ran and tag == want and good == true and bad == false then return native end
+  return false
+end
+
+function ChaCha20Poly1305Pure.tag_backend()
+  if ChaCha20Poly1305Pure._tag == nil then
+    ChaCha20Poly1305Pure._tag = _resolve_native_tag()
+  end
+  return ChaCha20Poly1305Pure._tag and "native" or "lua"
+end
+
+local function _use_native_tag(ciphertext)
+  return #ciphertext >= ChaCha20Poly1305Pure.NATIVE_TAG_MIN_BYTES
+    and ChaCha20Poly1305Pure.tag_backend() == "native"
+end
+
 function ChaCha20Poly1305Pure.encrypt(key, nonce, plaintext, aad)
   aad = aad or ""
-  local otk = ChaCha20Poly1305Pure.chacha20(key, nonce, 0, _OTK_ZEROS)
   local ciphertext = ChaCha20Poly1305Pure.chacha20(key, nonce, 1, plaintext)
-  local mac_data = aad .. _pad16(aad) .. ciphertext .. _pad16(ciphertext) ..
-    Bytes.uint_le(#aad, 8) .. Bytes.uint_le(#ciphertext, 8)
-  return ciphertext .. ChaCha20Poly1305Pure.poly1305_mac(mac_data, otk)
+  if _use_native_tag(ciphertext) then
+    local ok, tag = pcall(ChaCha20Poly1305Pure._tag.tag, key, nonce, aad, ciphertext)
+    if ok and type(tag) == "string" and #tag == 16 then return ciphertext .. tag end
+  end
+  return ciphertext .. ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad)
 end
 
 function ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad)
@@ -1437,8 +1528,15 @@ function ChaCha20Poly1305Pure.decrypt(key, nonce, ciphertext_and_tag, aad)
   assert(#ciphertext_and_tag >= 16, "ChaCha20-Poly1305 ciphertext is missing auth tag")
   local ciphertext = ciphertext_and_tag:sub(1, #ciphertext_and_tag - 16)
   local tag = ciphertext_and_tag:sub(#ciphertext_and_tag - 15)
-  local expected = ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad or "")
-  assert(tag == expected, "ChaCha20-Poly1305 authentication failed")
+  -- native may only accept; a native reject is rechecked in Lua
+  local ok, verified = false, nil
+  if _use_native_tag(ciphertext) then
+    ok, verified = pcall(ChaCha20Poly1305Pure._tag.verify, key, nonce, aad or "", ciphertext, tag)
+  end
+  if not (ok and verified == true) then
+    local expected = ChaCha20Poly1305Pure.auth_tag(key, nonce, ciphertext, aad or "")
+    assert(tag == expected, "ChaCha20-Poly1305 authentication failed")
+  end
   return ChaCha20Poly1305Pure.chacha20(key, nonce, 1, ciphertext)
 end
 
