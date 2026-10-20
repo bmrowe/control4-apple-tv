@@ -5286,7 +5286,14 @@ local function ed25519_stub_openssl(calls)
       assert_eq(format, "der", "key format")
       calls.read = calls.read + 1
       for _, v in ipairs(vectors) do
-        if private and der == pkcs8 .. v.seed or not private and der == spki .. v.pub then return { v = v } end
+        if private and der == pkcs8 .. v.seed or not private and der == spki .. v.pub then
+          return { v = v, get_public = function(self)
+            return { export = function(_, fmt)
+              assert_eq(fmt, "der", "export format")
+              return spki .. self.v.pub
+            end }
+          end }
+        end
       end
       return nil, "unknown key"
     end },
@@ -5479,6 +5486,84 @@ function tests.x25519_falls_back_when_native_misbehaves()
     assert_eq(O._derive_x25519(pair.private_key, peers[1]), X.mul(pair.private_key, peers[1]), "ladder shared")
     O._x25519_native = { shared = function() return nil end }
     assert_eq(O._derive_x25519(pair.private_key, peers[3]), X.mul(pair.private_key, peers[3]), "twist via ladder")
+  end)
+end
+
+-- Swaps the pure-Lua curve entry points for ones that fail loudly.
+local function with_pure_curves_forbidden(fn)
+  local X, E = Driver.X25519Pure, Driver.Ed25519Pure
+  local saved = { X.mul, E.public_key_from_private, E.sign, E.sign_expanded, E.verify }
+  local function forbidden(name) return function() error(name .. " should not run", 2) end end
+  X.mul, E.public_key_from_private = forbidden("X25519Pure.mul"), forbidden("Ed25519Pure.public_key_from_private")
+  E.sign, E.sign_expanded, E.verify = forbidden("Ed25519Pure.sign"), forbidden("Ed25519Pure.sign_expanded"),
+    forbidden("Ed25519Pure.verify")
+  local ok, err = pcall(fn)
+  X.mul, E.public_key_from_private, E.sign, E.sign_expanded, E.verify = saved[1], saved[2], saved[3], saved[4], saved[5]
+  if not ok then error(err, 0) end
+end
+
+local function run_self_test(O)
+  local saved = O.self_tested
+  O.self_tested = false
+  local ok, result = pcall(O.self_test)
+  O.self_tested = saved
+  if not ok then error(result, 0) end
+  return result
+end
+
+function tests.self_test_checks_the_native_paths_without_the_pure_fallbacks()
+  with_x25519_backend(nil, function(O)
+    with_ed25519_backend(nil, function()
+      assert(O.x25519_backend() == "native+native" and O.ed25519_backend() == "native",
+        "requires lua-openssl native curves")
+      with_pure_curves_forbidden(function()
+        assert_eq(run_self_test(O), true, "self test on native paths")
+      end)
+    end)
+  end)
+end
+
+function tests.self_test_checks_the_lua_paths_when_native_is_unavailable()
+  local O = Driver.OpenSSLCrypto
+  assert(pcall(require, "openssl"), "requires lua-openssl for the bn ladder")
+  local saved_x, saved_ed, saved_cache = O._x25519_native, O._ed25519_native, O.ed25519_private_key_cache
+  O._x25519_native, O._ed25519_native, O.ed25519_private_key_cache = false, false, {}
+  local ok, err = pcall(function()
+    assert_eq(O.x25519_backend(), "lua+lua", "x25519 forced to Lua")
+    assert_eq(O.ed25519_backend(), "lua", "ed25519 forced to Lua")
+    assert_eq(run_self_test(O), true, "self test on Lua paths")
+  end)
+  O._x25519_native, O._ed25519_native, O.ed25519_private_key_cache = saved_x, saved_ed, saved_cache
+  if not ok then error(err, 0) end
+end
+
+function tests.x25519_probe_uses_known_answers_not_the_ladder()
+  with_x25519_backend(nil, function(O)
+    with_pure_curves_forbidden(function()
+      assert(O.x25519_backend() == "native+native", "requires lua-openssl X25519 routes")
+    end)
+  end)
+end
+
+function tests.ed25519_key_expansion_takes_the_public_key_from_native()
+  local E = Driver.Ed25519Pure
+  local seed = Driver.Bytes.from_hex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7")
+  with_ed25519_backend(nil, function(O)
+    assert(O.ed25519_backend() == "native", "requires lua-openssl Ed25519")
+    local native, calls = O._ed25519_native, 0
+    local original = native.public_key
+    native.public_key = function(s) calls = calls + 1; return original(s) end
+    local expanded = O._expanded_ed25519_private_key(seed)
+    native.public_key = original
+    assert_eq(calls, 1, "native public key used")
+    assert_eq(expanded.public_key, E.public_key_from_private(seed), "matches the bn derivation")
+    assert_eq(O._expanded_ed25519_private_key(seed), expanded, "cached")
+
+    O.ed25519_private_key_cache = {}
+    native.public_key = function() error("boom") end
+    local fallback = O._expanded_ed25519_private_key(seed)
+    native.public_key = original
+    assert_eq(fallback.public_key, expanded.public_key, "bn fallback when native fails")
   end)
 end
 

@@ -1956,7 +1956,7 @@ function Ed25519Pure.public_key_from_private(private_key)
   return _encode_point(_scalar_mult(_B, a_le))
 end
 
-function Ed25519Pure.expand_private_key(private_key)
+function Ed25519Pure.expand_private_key(private_key, public_key)
   assert(type(private_key) == "string" and #private_key == 32, "Ed25519 private key must be 32 bytes")
   _ensure_curve()
   local h = _sha512_bytes(private_key)
@@ -1966,7 +1966,7 @@ function Ed25519Pure.expand_private_key(private_key)
     scalar = le_to_bn(a_le),
     scalar_le = a_le,
     prefix = h:sub(33, 64),
-    public_key = _encode_point(_scalar_mult(_B, a_le)),
+    public_key = public_key or _encode_point(_scalar_mult(_B, a_le)),
   }
 end
 
@@ -2323,7 +2323,9 @@ local function _resolve_native_x25519()
   end
   local kat_seed = Bytes.from_hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
   local ran, pair = pcall(keygen_from_seed, kat_seed)
-  if ran and type(pair) == "table" and pair.public_key == X25519Pure.mul(pair.private_key, X25519Pure.BASE_POINT) then
+  if ran and type(pair) == "table"
+      and pair.private_key == Bytes.from_hex("307c83864f2833cb427a2ef1c00a013cfdff2768d980c0a3a520f006904de94f")
+      and pair.public_key == Bytes.from_hex("d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e") then
     function native.keygen() return keygen_from_seed(OpenSSLCrypto.random_bytes(32)) end
   end
 
@@ -2439,6 +2441,11 @@ local function _resolve_native_ed25519()
     assert(type(signature) == "string" and #signature == 64, "native Ed25519 signature invalid")
     return signature
   end
+  function native.public_key(seed)
+    local public_key = read(pkcs8 .. seed, true, "der"):get_public():export("der"):sub(-32)
+    assert(#public_key == 32, "native Ed25519 public key invalid")
+    return public_key
+  end
   function native.verify(public_key, signature, message)
     if native.peer ~= public_key then
       native.peer_key = assert(read(spki .. public_key, false, "der"))
@@ -2453,6 +2460,7 @@ local function _resolve_native_ed25519()
   local tampered = signature:sub(1, 63) .. string.char((signature:byte(64) + 1) % 256)
   local ran, passed = pcall(function()
     return native.sign({ private_key = seed }, "") == signature
+      and native.public_key(seed) == public_key
       and native.verify(public_key, signature, "")
       and not native.verify(public_key, tampered, "")
       and not native.verify(public_key, signature, "x")
@@ -2487,7 +2495,12 @@ function OpenSSLCrypto._expanded_ed25519_private_key(private_key_bytes)
   local key = Bytes.hex(private_key_bytes)
   local expanded = OpenSSLCrypto.ed25519_private_key_cache[key]
   if not expanded then
-    expanded = Ed25519Pure.expand_private_key(private_key_bytes)
+    local public_key
+    if OpenSSLCrypto.ed25519_backend() == "native" then
+      local ok, native_public = pcall(OpenSSLCrypto._ed25519_native.public_key, private_key_bytes)
+      if ok then public_key = native_public end
+    end
+    expanded = Ed25519Pure.expand_private_key(private_key_bytes, public_key)
     OpenSSLCrypto.ed25519_private_key_cache[key] = expanded
   end
   return expanded
@@ -2654,7 +2667,8 @@ end
 
 function OpenSSLCrypto.self_test(progress)
   progress = progress or function() end
-  -- X25519: RFC 7748 Section 6.1 test vector (pure-Lua path, no openssl needed)
+  -- Vectors go through the production entry points, so this checks whichever
+  -- backend (native or Lua) each primitive resolved to.
   progress("crypto self-test: X25519 RFC 7748 started")
   local x_alice_priv = Bytes.from_hex(
     "77076d0a7318a57d3c16c17251b26645" ..
@@ -2672,7 +2686,7 @@ function OpenSSLCrypto.self_test(progress)
     "4a5d9d5ba4ce2de1728e3bf480350f25" ..
     "e07e21c947d19e3376f09b3c1e161742"
   )
-  local x_public = X25519Pure.mul(x_alice_priv, X25519Pure.BASE_POINT)
+  local x_public = OpenSSLCrypto._derive_x25519(x_alice_priv, X25519Pure.BASE_POINT)
   if x_public ~= x_alice_pub then
     error("X25519 RFC 7748 base point vector failed: got " ..
       Bytes.hex(x_public) .. " expected " .. Bytes.hex(x_alice_pub))
@@ -2682,6 +2696,9 @@ function OpenSSLCrypto.self_test(progress)
     error("X25519 RFC 7748 test vector failed: got " ..
       Bytes.hex(x_shared) .. " expected " .. Bytes.hex(x_expected))
   end
+  local x_pair = OpenSSLCrypto.generate_x25519_keypair()
+  assert(OpenSSLCrypto._derive_x25519(x_pair.private_key, X25519Pure.BASE_POINT) == x_pair.public_key,
+    "X25519 generated keypair is inconsistent")
   progress("crypto self-test: X25519 RFC 7748 passed")
 
   progress("crypto self-test: HMAC-SHA512 started")
@@ -2743,10 +2760,10 @@ function OpenSSLCrypto.self_test(progress)
 
   progress("crypto self-test: Ed25519 started")
   local ed_seed = Bytes.from_hex("9d61b19deffd5a60ba844af492ec2cc4" .. "4449c5697b326919703bac031cae7f60")
-  local ed_public = Ed25519Pure.public_key_from_private(ed_seed)
+  local ed_public = OpenSSLCrypto._expanded_ed25519_private_key(ed_seed).public_key
   local ed_expected_public = Bytes.from_hex("d75a980182b10ab7d54bfed3c964073a" .. "0ee172f3daa62325af021a68f707511a")
   assert(ed_public == ed_expected_public, "Ed25519 RFC 8032 public key vector failed")
-  local ed_signature = Ed25519Pure.sign(ed_seed, ed_public, "")
+  local ed_signature = OpenSSLCrypto._sign_ed25519(ed_seed, "", ed_public)
   local ed_expected_signature = Bytes.from_hex(
     "e5564300c360ac729086e2cc806e828a" ..
     "84877f1eb8e5d974d873e06522490155" ..
@@ -2754,7 +2771,8 @@ function OpenSSLCrypto.self_test(progress)
     "d25bf5f0595bbe24655141438e7a100b"
   )
   assert(ed_signature == ed_expected_signature, "Ed25519 RFC 8032 signature vector failed")
-  assert(Ed25519Pure.verify(ed_public, ed_signature, ""), "Ed25519 RFC 8032 verify vector failed")
+  assert(OpenSSLCrypto._verify_ed25519(ed_public, ed_signature, "") == true, "Ed25519 RFC 8032 verify vector failed")
+  assert(not OpenSSLCrypto._verify_ed25519(ed_public, ed_signature, "x"), "Ed25519 accepted a tampered message")
   progress("crypto self-test: Ed25519 passed")
 
   OpenSSLCrypto.self_tested = true
