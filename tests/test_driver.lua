@@ -5403,6 +5403,85 @@ function tests.ed25519_real_openssl_backend_is_native()
   end)
 end
 
+local function with_x25519_backend(openssl_module, fn)
+  local O = Driver.OpenSSLCrypto
+  local saved_native, saved_module = O._x25519_native, package.loaded.openssl
+  if openssl_module ~= nil then package.loaded.openssl = openssl_module end
+  O._x25519_native = nil
+  local ok, err = pcall(fn, O)
+  O._x25519_native, package.loaded.openssl = saved_native, saved_module
+  if not ok then error(err, 0) end
+end
+
+local function x25519_peers()
+  local B, X = Driver.Bytes, Driver.X25519Pure
+  local peers, seed = {
+    B.from_hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"),
+    X.BASE_POINT,
+    string.char(2) .. string.rep("\0", 31),                    -- twist
+    string.rep("\0", 32), string.char(1) .. string.rep("\0", 31), -- low order
+    string.rep("\255", 32),                                     -- non-canonical
+  }, 99
+  local function blob()
+    local t = {}
+    for i = 1, 32 do seed = (seed * 1103515245 + 12345) % 2147483648; t[i] = string.char(seed % 256) end
+    return table.concat(t)
+  end
+  for _ = 1, 12 do
+    peers[#peers + 1] = X.mul(blob(), X.BASE_POINT)
+    peers[#peers + 1] = blob()
+  end
+  return peers, blob
+end
+
+function tests.x25519_native_keygen_and_shared_secret_match_the_ladder()
+  local B, X = Driver.Bytes, Driver.X25519Pure
+  with_x25519_backend(nil, function(O)
+    assert(O.x25519_backend() == "native+native", "requires lua-openssl X25519 routes")
+    local alice = B.from_hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    local bob = B.from_hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    local shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+    assert_eq(B.hex(O._derive_x25519(alice, X.mul(bob, X.BASE_POINT))), shared, "RFC 7748 alice")
+    assert_eq(B.hex(O._derive_x25519(bob, X.mul(alice, X.BASE_POINT))), shared, "RFC 7748 bob")
+    local peers, blob = x25519_peers()
+    for i = 1, 8 do
+      local pair = O.generate_x25519_keypair()
+      assert_eq(pair.public_key, X.mul(pair.private_key, X.BASE_POINT), "keypair " .. i)
+      local k = i <= 4 and pair.private_key or blob()
+      for n, peer in ipairs(peers) do
+        assert_eq(B.hex(O._derive_x25519(k, peer)), B.hex(X.mul(k, peer)), "key " .. i .. " peer " .. n)
+      end
+    end
+  end)
+end
+
+function tests.x25519_native_routes_need_openssl_pkey()
+  with_x25519_backend({}, function(O)
+    assert_eq(O.x25519_backend(), "lua+lua", "no openssl")
+  end)
+  local broken = { pkey = { read = function() error("unsupported") end, derive = function() error("no") end } }
+  with_x25519_backend(broken, function(O)
+    assert_eq(O.x25519_backend(), "lua+lua", "pkey that cannot import")
+  end)
+end
+
+function tests.x25519_falls_back_when_native_misbehaves()
+  local X = Driver.X25519Pure
+  with_x25519_backend({}, function(O)
+    O._x25519_native = {
+      keygen = function() return { private_key = "short", public_key = "bad" } end,
+      shared = function() error("boom") end,
+    }
+    local pair = O.generate_x25519_keypair()
+    assert_eq(#pair.private_key, 32, "ladder keypair")
+    assert_eq(pair.public_key, X.mul(pair.private_key, X.BASE_POINT), "ladder public key")
+    local peers = x25519_peers()
+    assert_eq(O._derive_x25519(pair.private_key, peers[1]), X.mul(pair.private_key, peers[1]), "ladder shared")
+    O._x25519_native = { shared = function() return nil end }
+    assert_eq(O._derive_x25519(pair.private_key, peers[3]), X.mul(pair.private_key, peers[3]), "twist via ladder")
+  end)
+end
+
 function tests.crypto_random_bytes_requires_provider()
   local old = Driver.Crypto.provider
   Driver.Crypto.provider = nil

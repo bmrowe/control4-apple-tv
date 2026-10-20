@@ -2286,7 +2286,115 @@ local function openssl_assert(value, err, label)
   return value
 end
 
+-- lua-openssl 0.8.5 refuses X25519 derive, but curve25519 maps onto curves it
+-- does handle. Keygen: an Ed25519 key's scalar is X25519-clamped, and its
+-- public y gives u = (1+y)/(1-y). Shared secret: ECDH on Wei25519 (x = u + A/3)
+-- from explicit-parameter DER keys. Each half is adopted only if it passes its
+-- known answers; twist and low-order peers fall back to the ladder.
+local function _resolve_native_x25519()
+  local ok, openssl = pcall(require, "openssl")
+  if not ok or type(openssl) ~= "table" or type(openssl.pkey) ~= "table" then return false end
+  local read, derive = openssl.pkey.read, openssl.pkey.derive
+  if type(read) ~= "function" then return false end
+  _ensure_curve()
+  local function clamp(k)
+    local b = { k:byte(1, 32) }
+    b[1] = b[1] - b[1] % 8
+    b[32] = b[32] % 64 + 64
+    for i = 1, 32 do b[i] = string.char(b[i]) end
+    return table.concat(b)
+  end
+  local function u_of(u_bytes)
+    local b = { u_bytes:byte(1, 32) }
+    b[32] = b[32] % 128
+    for i = 1, 32 do b[i] = string.char(b[i]) end
+    return _bn.mod(le_to_bn(table.concat(b)), _P)
+  end
+  local native = {}
+
+  local pkcs8_ed = Bytes.from_hex("302e020100300506032b657004220420")
+  local function keygen_from_seed(seed)
+    local A = read(pkcs8_ed .. seed, true, "der"):get_public():export("der"):sub(-32)
+    local y = u_of(A)
+    return {
+      private_key = clamp(_sha512_bytes(seed):sub(1, 32)),
+      public_key = bn_to_le(fmul(fadd(_F1, y), finv(fsub(_F1, y))), 32),
+    }
+  end
+  local kat_seed = Bytes.from_hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+  local ran, pair = pcall(keygen_from_seed, kat_seed)
+  if ran and type(pair) == "table" and pair.public_key == X25519Pure.mul(pair.private_key, X25519Pure.BASE_POINT) then
+    function native.keygen() return keygen_from_seed(OpenSSLCrypto.random_bytes(32)) end
+  end
+
+  if type(derive) == "function" then
+    local function der(tag, body)
+      local n, len = #body, ""
+      if n < 128 then
+        len = string.char(n)
+      else
+        while n > 0 do len = string.char(n % 256) .. len; n = math.floor(n / 256) end
+        len = string.char(128 + #len) .. len
+      end
+      return string.char(tag) .. len .. body
+    end
+    local function be32(v) return bn_to_le(v, 32):reverse() end
+    local function int(bytes)
+      bytes = bytes:gsub("^%z+", "")
+      if bytes == "" or bytes:byte(1) >= 128 then bytes = "\0" .. bytes end
+      return der(0x02, bytes)
+    end
+    local function seq(...) return der(0x30, table.concat({ ... })) end
+    local A = _bn.number(486662)
+    local a3 = fmul(A, finv(_bn.number(3)))
+    local wa = fmul(fsub(_bn.number(3), fsqr(A)), finv(_bn.number(3)))
+    local wb = fmul(fsub(fmul(_bn.number(2), fmul(A, fsqr(A))), fmul(_bn.number(9), A)), finv(_bn.number(27)))
+    local gx = fadd(_bn.number(9), a3)
+    local gy = _bn.sqrtmod(fadd(fmul(gx, fadd(fsqr(gx), wa)), wb), _P)
+    local G = "\4" .. be32(gx) .. be32(gy)
+    local params = seq(int("\1"), seq(Bytes.from_hex("06072a8648ce3d0101"), int(be32(_P))),
+      seq(der(0x04, be32(wa)), der(0x04, be32(wb))), der(0x04, G), int(be32(_L)), int("\8"))
+    local spki = seq(Bytes.from_hex("06072a8648ce3d0201"), params)
+    local function shared(k, u_bytes)
+      -- a compressed point off the curve (u on the twist) fails to import
+      local peer = read(seq(spki, der(0x03, "\0\2" .. be32(fadd(u_of(u_bytes), a3)))), false, "der")
+      if not peer then return nil end
+      -- the unchecked G stands in for k*G, which d2i would otherwise compute
+      local key = read(seq(int("\1"), der(0x04, clamp(k):reverse()), der(0xa0, params),
+        der(0xa1, der(0x03, "\0" .. G))), true, "der")
+      return bn_to_le(fsub(_bn.text(derive(key, peer)), a3), 32)
+    end
+    local alice = Bytes.from_hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    local bob = Bytes.from_hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+    local twist = string.char(2) .. string.rep("\0", 31)
+    local ran_dh, rfc, off_curve = pcall(function()
+      local twist_ok, twist_out = pcall(shared, alice, twist)
+      return shared(alice, bob), twist_ok and twist_out or nil
+    end)
+    if ran_dh and off_curve == nil and rfc ==
+        Bytes.from_hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742") then
+      native.shared = shared
+    end
+  end
+  return (native.keygen or native.shared) and native or false
+end
+
+function OpenSSLCrypto.x25519_backend()
+  if OpenSSLCrypto._x25519_native == nil then
+    local ok, native = pcall(_resolve_native_x25519)
+    OpenSSLCrypto._x25519_native = ok and native or false
+  end
+  local native = OpenSSLCrypto._x25519_native or {}
+  return (native.keygen and "native" or "lua") .. "+" .. (native.shared and "native" or "lua")
+end
+
 function OpenSSLCrypto.generate_x25519_keypair()
+  OpenSSLCrypto.x25519_backend()
+  local native = OpenSSLCrypto._x25519_native
+  if native and native.keygen then
+    local ok, pair = pcall(native.keygen)
+    if ok and type(pair) == "table" and #pair.private_key == 32 and #pair.public_key == 32 then return pair end
+  end
   local scalar = OpenSSLCrypto.random_bytes(32)
   return {
     private_key = scalar,
@@ -2297,6 +2405,12 @@ end
 function OpenSSLCrypto._derive_x25519(private_key, server_public_key)
   assert(type(private_key) == "string" and #private_key == 32,
     "X25519 private key must be 32 raw bytes")
+  OpenSSLCrypto.x25519_backend()
+  local native = OpenSSLCrypto._x25519_native
+  if native and native.shared and type(server_public_key) == "string" and #server_public_key == 32 then
+    local ok, secret = pcall(native.shared, private_key, server_public_key)
+    if ok and type(secret) == "string" and #secret == 32 then return secret end
+  end
   return X25519Pure.mul(private_key, server_public_key)
 end
 
@@ -8358,7 +8472,8 @@ function C4Driver.init()
   Log.output("Lua runtime: " .. tostring(_VERSION) .. ", jit=" ..
     (jit and (tostring(jit.version) .. " " .. ((jit.status()) and "on" or "off")) or "none") ..
     ", chacha20=" .. ChaCha20Poly1305Pure.keystream_backend() ..
-    ", ed25519=" .. OpenSSLCrypto.ed25519_backend())
+    ", ed25519=" .. OpenSSLCrypto.ed25519_backend() ..
+    ", x25519=" .. OpenSSLCrypto.x25519_backend())
   Driver.state = Storage.load()
   DEBUGPRINT = Properties and Properties["Debug Mode"] == "On"
   Companion.app_list = Driver.state.app_list or {}
